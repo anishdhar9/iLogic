@@ -153,6 +153,32 @@
 '     this risk (right method, wrong argument count) — this was the only
 '     offender; everything else has either run cleanly across multiple
 '     real executions already or mirrors a call shape that has.
+'
+'  v7 — title block has now failed FIVE distinct ways, all with the exact
+'  same E_INVALIDARG (captured-instance object, captured-instance name
+'  string x2, ThisDrawing wrapper, freshly-looked-up-by-name object). A
+'  real run confirmed the v6 fresh-lookup attempt reaches AddTitleBlock
+'  with what looks like a valid TitleBlockDefinition (no separate lookup
+'  error) and STILL gets rejected — so this isn't about finding the right
+'  object, something else is wrong.
+'   * Split the lookup and the AddTitleBlock call into separate Try blocks
+'     so the next run's log says definitively which one is throwing,
+'     rather than one shared message covering both.
+'   * One more hypothesis, grounded in real reference code rather than
+'     imagination: createSheets' only confirmed-working AddTitleBlock call
+'     always supplies the 3rd PromptStrings argument (even just empty
+'     strings) — every attempt in this file so far has omitted it entirely.
+'     Trying a 2-empty-string array now, matching that reference's shape
+'     (its exact required length for THIS title block is unknown).
+'   * If this ALSO fails identically: treat that as the signal to stop
+'     guessing entirely and get a screenshot of what IntelliSense shows
+'     immediately after typing "oSheet.AddTitleBlock(" in the iLogic editor
+'     — the compiler error already gave the signature, but every parameter
+'     is typed Object, so the signature alone can't reveal what values are
+'     actually valid. This is the same technique (screenshot of the
+'     Inventor UI) that already unblocked the balloon/border/title-block
+'     wrapper calls earlier in this project — worth reaching for now rather
+'     than a 7th blind code guess.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -576,16 +602,26 @@ Sub ApplySheetFormat(oDrawDoc As DrawingDocument, oSheet As Sheet, sTBName As St
 ' That's a materially worse failure mode than any runtime E_INVALIDARG or
 ' "member not found" seen elsewhere in this file, and it's now removed.
 '
-' Remaining approach: a TitleBlockDefinition freshly looked up from the
-' DOCUMENT's own TitleBlockDefinitions collection by name — genuinely
-' untested until now, since the compile error above always aborted the rule
-' before reaching it. sTBName as a plain string is not retried here — it has
-' already failed via a real RUNTIME E_INVALIDARG twice (v2's oTBDef.Name,
-' v3/v4's sTBName directly).
-' <-- If this also fails: type "oSheet.AddTitleBlock(" in the iLogic editor
-'     and read the IntelliSense tooltip — expect the same signature as
-'     above, but the unused TitleBlockLocation parameter may be worth
-'     passing too if a plain definition object alone isn't enough.
+' v7 update: a real run showed "TitleBlockDefinitions.Item(sTBName)" +
+' AddTitleBlock(oTBDef) STILL failing with the identical E_INVALIDARG —
+' the 5th distinct attempt to fail exactly the same way (captured-instance
+' object, captured-instance name string x2, ThisDrawing wrapper, freshly-
+' looked-up object). That log line couldn't tell us WHICH of the two calls
+' inside the Try actually threw, so this version splits them into separate
+' Try blocks for a clean answer next run.
+'
+' Also trying the one thing every CONFIRMED-WORKING AddTitleBlock call seen
+' so far (createSheets) does differently from every attempt in this file:
+' it always supplies the 3rd PromptStrings argument, even just empty
+' strings, rather than omitting it. Every attempt here so far has omitted
+' it. Worth testing since it's grounded in the one piece of real working
+' reference code for this exact method, not another blind guess.
+' <-- If this ALSO fails identically: I'm out of well-motivated hypotheses.
+'     The most useful next step is a screenshot of what IntelliSense shows
+'     immediately after typing "oSheet.AddTitleBlock(" in the iLogic editor
+'     (same technique that worked for the snippet browser earlier) — that
+'     shows argument types live, which the compiler error didn't fully
+'     resolve (Object-typed params don't reveal what's actually valid).
 
     Try
         oSheet.AddDefaultBorder()
@@ -594,14 +630,28 @@ Sub ApplySheetFormat(oDrawDoc As DrawingDocument, oSheet As Sheet, sTBName As St
     End Try
 
     If Not String.IsNullOrEmpty(sTBName) Then
+        Dim oTBDef As TitleBlockDefinition = Nothing
         Try
-            Dim oTBDef As TitleBlockDefinition = oDrawDoc.TitleBlockDefinitions.Item(sTBName)
-            oSheet.AddTitleBlock(oTBDef)
+            oTBDef = oDrawDoc.TitleBlockDefinitions.Item(sTBName)
         Catch ex As Exception
-            Logger.Warn("AddTitleBlock(TitleBlockDefinitions.Item(""" & sTBName & """)) failed on '" & _
-                oSheet.Name & "': " & ex.Message & ". Type ""oSheet.AddTitleBlock("" in the iLogic " & _
-                "editor and read the IntelliSense tooltip for the real signature if this keeps failing.")
+            Logger.Warn("TitleBlockDefinitions.Item(""" & sTBName & """) lookup failed on '" & _
+                oSheet.Name & "': " & ex.Message & " — the name captured from sheet 1 doesn't resolve " & _
+                "in this document's own title block library.")
         End Try
+
+        If Not (oTBDef Is Nothing) Then
+            Try
+                Dim sPrompts(1) As String
+                sPrompts(0) = ""
+                sPrompts(1) = ""
+                oSheet.AddTitleBlock(oTBDef, , sPrompts)
+            Catch ex As Exception
+                Logger.Warn("AddTitleBlock(oTBDef, , emptyPrompts) failed on '" & oSheet.Name & _
+                    "' even with a valid TitleBlockDefinition in hand (lookup by name succeeded): " & _
+                    ex.Message & ". This is the 6th distinct attempt failing the same way — see the " & _
+                    "v7 header note for the screenshot ask that should unblock this for good.")
+            End Try
+        End If
     End If
 
 End Sub
