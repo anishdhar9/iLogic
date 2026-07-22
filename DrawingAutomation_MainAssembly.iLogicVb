@@ -53,6 +53,30 @@
 '     Documents.Add(..., True). Whether ThisDrawing tracks that switch within
 '     the same rule execution is NOT yet confirmed — wrapped in Try/Catch
 '     with a fallback, per the established pattern. Check Logger output.
+'
+'  v4 — sheet metal parts (e.g. the stair stringer, per the reference sheet
+'  the user provided) get a different, industry-standard layout instead of
+'  FRONT/TOP/RIGHT+ISO: FLAT PATTERN + BEND TABLE + a folded ISO for
+'  reference. Detected via TypeOf ... Is SheetMetalComponentDefinition (same
+'  defensive TypeOf pattern already used for the assembly-level Weldment
+'  check, rather than an "IsSheetMetal" property that may not exist, or the
+'  "Document SubType Name" iProperty string, which is UI-language-dependent —
+'  this install appears to be German going by the part names).
+'   * Flat pattern view: ViewInfo NameValueMap with "SheetMetalFoldedModel" =
+'     False — confirmed-in-the-wild (createSheets-style production code, same
+'     source repo already mined for the PartsLists.Add enum values), not a
+'     fresh guess.
+'   * Bend table: Sheet.BendTables.Add(flatView, point) — this one IS a fresh
+'     guess, not present anywhere in the snippet dump or the linked repos.
+'     Try/Catch-wrapped; if it throws, check "oSheet.BendTables.Add(" via
+'     IntelliSense in the iLogic editor (same verification method that fixed
+'     PartsLists.Add earlier) and update BuildSheetMetalViews().
+'   * Folded ISO view reuses the existing AddViewSafe/kIsoTopRightViewOrientation
+'     path with no special options — createSheets shows this is what makes it
+'     default to the FOLDED shape rather than flat.
+'   * Layout percentages are a rough match to the reference sheet, not an
+'     exact one — same "functional, not beautiful, may need a manual nudge"
+'     caveat already given for balloon placement.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -261,6 +285,12 @@ Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
 
     ApplySheetFormat(oSheet, sBorderName, sTBName)
 
+    If IsSheetMetal(oPartDoc) Then
+        BuildSheetMetalViews(oSheet, oPartDoc, OrthoStyle, IsoStyle, MarginL, MarginR, MarginT, MarginB)
+        Exit Sub
+    End If
+
+    ' ---------------- non-sheet-metal: FRONT/TOP/RIGHT + ISO ----------------
     ' Create all four views 1:1 mid-sheet (they will overflow the sheet edges —
     ' harmless and transient), measure, then rescale + position.
     Dim oC As Point2d = oTG.CreatePoint2d(oSheet.Width / 2, oSheet.Height / 2)
@@ -315,6 +345,131 @@ Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
     Logger.Info("Sheet '" & oSheet.Name & "': scale " & s)
 
 End Sub
+
+
+' =====================================================================
+Sub BuildSheetMetalViews(oSheet As Sheet, oPartDoc As Document, _
+        OrthoStyle As DrawingViewStyleEnum, IsoStyle As DrawingViewStyleEnum, _
+        MarginL As Double, MarginR As Double, MarginT As Double, MarginB As Double)
+' Sheet metal parts get FLAT PATTERN + BEND TABLE (for the brake operator)
+' plus a folded ISO view for reference, matching the company's existing
+' sheet metal drawing format — instead of FRONT/TOP/RIGHT orthographic views,
+' which are less useful once a part is just a bent flat blank.
+'
+' <-- UNVERIFIED: Sheet.BendTables.Add(view, point) signature is from API
+'     memory, not confirmed against this Inventor build (it is not in the
+'     snippet browser dump or either linked repo). If it throws, type
+'     "oSheet.BendTables.Add(" in the iLogic editor and read the IntelliSense
+'     tooltip for the real parameter list — the same approach that fixed
+'     PartsLists.Add earlier — then update the line below.
+
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim oSMDef As SheetMetalComponentDefinition = TryCast(oPartDoc.ComponentDefinition, SheetMetalComponentDefinition)
+    If oSMDef Is Nothing Then
+        Logger.Warn("'" & oPartDoc.DisplayName & "' did not cast to SheetMetalComponentDefinition — skipping flat pattern/bend table.")
+        Exit Sub
+    End If
+
+    Try
+        If Not oSMDef.HasFlatPattern Then oSMDef.Unfold()
+    Catch ex As Exception
+        Logger.Warn("Could not unfold '" & oPartDoc.DisplayName & "' for a flat pattern: " & ex.Message)
+    End Try
+
+    Dim usableW As Double = oSheet.Width - MarginL - MarginR
+    Dim usableH As Double = oSheet.Height - MarginB - MarginT
+
+    ' ---- Flat pattern: upper-left, wide strip (matches the reference sheet) ----
+    Dim oFlatPos As Point2d = oTG.CreatePoint2d(MarginL + usableW * 0.32, MarginB + usableH * 0.72)
+    Dim oFlatView As DrawingView = AddFlatPatternViewSafe(oSheet, oPartDoc, oFlatPos, 1.0, OrthoStyle, "FLAT PATTERN")
+
+    If Not (oFlatView Is Nothing) Then
+        Dim sFit As Double = Math.Min((usableW * 0.62) / Math.Max(oFlatView.Width, 0.001), _
+                                      (usableH * 0.5) / Math.Max(oFlatView.Height, 0.001))
+        If sFit > 0 Then SetScaleSafe(oFlatView, SnapScale(sFit), "FLAT PATTERN")
+        SetPosSafe(oFlatView, MarginL + usableW * 0.32, MarginB + usableH * 0.72)
+
+        ' ---- Bend table: below the flat view ----
+        Try
+            Dim oBTPos As Point2d = oTG.CreatePoint2d(MarginL, MarginB + usableH * 0.32)
+            oSheet.BendTables.Add(oFlatView, oBTPos)
+        Catch ex As Exception
+            Logger.Warn("Bend table failed for '" & oPartDoc.DisplayName & "': " & ex.Message & _
+                " — check IntelliSense for the real Sheet.BendTables.Add signature and update " & _
+                "BuildSheetMetalViews(). Continuing without a bend table; flat pattern/ISO still placed.")
+        End Try
+    Else
+        Logger.Warn("No flat pattern view for '" & oPartDoc.DisplayName & _
+            "' — confirm it has sheet metal features and a valid flat pattern.")
+    End If
+
+    ' ---- Folded ISO view: right side, for reference. No SheetMetalFoldedModel
+    ' option is passed here, so (per createSheets) this defaults to the FOLDED shape. ----
+    Dim oIsoPos As Point2d = oTG.CreatePoint2d(MarginL + usableW * 0.78, MarginB + usableH * 0.5)
+    Dim oIsoView As DrawingView = AddViewSafe(oSheet, oPartDoc, oIsoPos, 1.0, kIsoTopRightViewOrientation, IsoStyle, "ISO")
+    If Not (oIsoView Is Nothing) Then
+        Dim sFit2 As Double = Math.Min((usableW * 0.4) / Math.Max(oIsoView.Width, 0.001), _
+                                       (usableH * 0.75) / Math.Max(oIsoView.Height, 0.001))
+        If sFit2 > 0 Then SetScaleSafe(oIsoView, SnapScale(sFit2), "ISO")
+        SetPosSafe(oIsoView, MarginL + usableW * 0.78, MarginB + usableH * 0.5)
+    End If
+
+    Logger.Info("Sheet metal layout built for '" & oPartDoc.DisplayName & "'.")
+
+End Sub
+
+
+' =====================================================================
+Function AddFlatPatternViewSafe(oSheet As Sheet, oDoc As Document, oPos As Point2d, _
+        dScale As Double, eStyle As DrawingViewStyleEnum, sTag As String) As DrawingView
+' ViewInfo NameValueMap key "SheetMetalFoldedModel" = False is the confirmed-in-the-wild
+' way to get a flat-pattern base view (from createSheets-style production code — same
+' repo already mined for the PartsLists.Add enum values — not API memory).
+' Combining it with an explicit view name (6th positional arg) in the SAME call is NOT
+' itself confirmed — retries without a name, then renames the result, if the named form throws.
+
+    Dim oOpts As NameValueMap = ThisApplication.TransientObjects.CreateNameValueMap
+    Try
+        oOpts.Add("SheetMetalFoldedModel", False)
+        oOpts.Add("DisplayForeshortenedTangentEdges", True)
+    Catch ex As Exception
+        Logger.Warn("Could not build flat pattern ViewInfo options: " & ex.Message)
+    End Try
+
+    Try
+        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, kDefaultViewOrientation, eStyle, sTag, , oOpts)
+    Catch ex As Exception
+        Logger.Warn("Flat pattern view '" & sTag & "' (named form) failed: " & ex.Message & _
+            " — retrying without an explicit name.")
+        Try
+            Dim oV As DrawingView = oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, kDefaultViewOrientation, eStyle, , , oOpts)
+            Try
+                oV.Name = sTag
+            Catch
+                ' Cosmetic only — view is still usable under its default name
+            End Try
+            Return oV
+        Catch ex2 As Exception
+            Logger.Warn("Flat pattern view failed entirely on sheet '" & oSheet.Name & "': " & ex2.Message)
+            Return Nothing
+        End Try
+    End Try
+
+End Function
+
+
+' =====================================================================
+Function IsSheetMetal(oDoc As Document) As Boolean
+' TypeOf-based check, matching the same pattern already used for the assembly-
+' level Weldment check — safer than assuming an "IsSheetMetal" property exists,
+' or comparing the "Document SubType Name" iProperty string, which is
+' UI-language-dependent (this Inventor install appears to be German).
+    Try
+        Return TypeOf oDoc.ComponentDefinition Is SheetMetalComponentDefinition
+    Catch
+        Return False
+    End Try
+End Function
 
 
 ' =====================================================================
