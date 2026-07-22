@@ -1,12 +1,36 @@
 ' =====================================================================
-'  DRAWING AUTOMATION — Main Assembly
-'  Output: single multi-sheet .idw
-'    Sheet 1        = MAIN ASSEMBLY view + structured Parts-Only BOM + balloons
-'    Sheet 2..N     = one sheet per UNIQUE part (deduped by file), base iso view
+'  DRAWING AUTOMATION — Main Assembly  (rule name: DwgAutomate)
+'  Output: ONE multi-sheet drawing in the template's native format (.dwg)
+'    Sheet 1     = MAIN ASSEMBLY iso view + Parts-Only parts list + balloons
+'    Sheet 2..N  = one sheet per UNIQUE part:
+'                  FRONT / TOP / RIGHT in THIRD-ANGLE arrangement + ISO,
+'                  auto-scaled to fit the sheet (A3), border + title block
+'                  copied from sheet 1
 '
 '  Run with the main .iam as the ACTIVE document.
-'  Structured as External Rule (Sub Main + helper Subs) to avoid the
-'  "Rule needs a Sub Main() and End Sub" parser error.
+'  Structured as External Rule (Sub Main + helpers) — required by the parser.
+'
+'  v2 — changes after the first successful baseline run:
+'   * Views are no longer fixed 1:1: each view is created 1:1, measured via
+'     .Width/.Height, rescaled to fit, snapped to a standard scale
+'     (measure-then-rescale pattern lifted from working code: JRForman/createSheets)
+'   * Part sheets get FRONT/TOP/RIGHT + ISO. They are independent base views
+'     with explicit orientations (NOT AddProjectedView) so the third-angle
+'     ARRANGEMENT is guaranteed even if the template's drafting standard is
+'     first-angle (typical for DIN templates). Trade-off: views are not
+'     alignment-linked if dragged manually later.
+'   * New sheets get the border + title block from sheet 1 (baseline run
+'     produced bare sheets). AddDefaultBorder / AddTitleBlock(name,,prompts)
+'     are confirmed-in-the-wild calls (createSheets); the definition-object
+'     overloads tried first are wrapped with fallbacks.
+'   * PartsLists.Add third arg is a PartsListLevelEnum passed as raw value:
+'     46594 = kPartsOnly, 46593 = kStructured (numeric values confirmed in
+'     createSheets, which calls Add(view, point, 46593) in production).
+'     Replaces the Boolean-arg guess that failed in the baseline run.
+'   * AutoBalloon: macro recorder does not exist in this Inventor build, so
+'     the CommandManager placeholder is gone. Balloons are now placed with the
+'     documented route: view.DrawingCurves(occurrence) -> attach point ->
+'     Sheet.CreateGeometryIntent -> Sheet.Balloons.Add(leaderPoints).
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -15,14 +39,24 @@ Sub Main()
 
     ' ---------------- CONSTANTS — EDIT THESE ----------------
     Dim TemplatePath As String = "C:\VAULTWorkingFolder\Engineering\CAD Settings\TemplatesINV2024\acadglatt07.dwg"
-        ' confirmed working template — leave blank instead to fall back to Inventor's configured default
-    Dim OutputExt    As String = System.IO.Path.GetExtension(TemplatePath)   ' matches template format (.dwg here)
+    Dim OutputExt    As String = System.IO.Path.GetExtension(TemplatePath)   ' output format follows template (.dwg)
     Dim OutputPath   As String = ThisDoc.Path & "\" & ThisDoc.FileName(False) & "_DRAWINGS" & OutputExt
-    Dim ViewScale    As Double = 1.0
-    Dim ViewOrient   As ViewOrientationTypeEnum = kIsoTopRightViewOrientation
-    Dim ViewStyle    As DrawingViewStyleEnum = kShadedDrawingViewStyle
-        ' <-- was kShadedWithHiddenEdgesDrawingViewStyle (not a real member) — this one is high-confidence,
-        '     it's the most commonly used DrawingViewStyleEnum value in Inventor API samples
+
+    ' View styles. kHiddenLineDrawingViewStyle / kHiddenLineRemovedDrawingViewStyle /
+    ' kShadedDrawingViewStyle are all confirmed-in-the-wild members.
+    Dim OrthoStyle As DrawingViewStyleEnum = kHiddenLineDrawingViewStyle       ' ortho views show hidden lines (drafting convention)
+    Dim IsoStyle   As DrawingViewStyleEnum = kShadedDrawingViewStyle           ' confirmed working in baseline run
+    Dim MainStyle  As DrawingViewStyleEnum = kShadedDrawingViewStyle           ' sheet-1 assembly view
+
+    ' Sheet layout (cm, origin bottom-left). MarginBottom is large on purpose:
+    ' it keeps views clear of a DIN-style title block strip along the bottom.
+    ' Shrink it if your title block is smaller / positioned differently.
+    Dim MarginL As Double = 1.5
+    Dim MarginR As Double = 1.5
+    Dim MarginT As Double = 1.5
+    Dim MarginB As Double = 6.5
+    Dim ViewGap As Double = 1.5
+    Dim PartsListWidth As Double = 20.0    ' strip reserved on the right of sheet 1 for the parts list
 
     ' ---------------- VALIDATE ACTIVE DOC ----------------
     If ThisDoc.Document.DocumentType <> kAssemblyDocumentObject Then
@@ -39,13 +73,18 @@ Sub Main()
                 "Switch to Cut-List BOM manually if you want stock-length callouts instead.")
         End If
     Catch
-        ' Advisory only — WeldmentComponentDefinition check unavailable on this API surface, skip
+        ' Advisory only — skip if this check is unavailable on this API surface
     End Try
 
     ' ---------------- BUILD UNIQUE PART LIST FROM BOM ----------------
     Dim oBOM As BOM = oCompDef.BOM
     oBOM.StructuredViewEnabled = True
     oBOM.StructuredViewFirstLevelOnly = False
+    Try
+        oBOM.PartsOnlyViewEnabled = True   ' needed so the kPartsOnly parts list has a view to bind to
+    Catch ex As Exception
+        Logger.Warn("Could not enable Parts Only BOM view: " & ex.Message)
+    End Try
     Dim oBOMView As BOMView = oBOM.BOMViews.Item("Structured")
 
     Dim uniqueParts As New Dictionary(Of String, Document)
@@ -57,17 +96,15 @@ Sub Main()
     If String.IsNullOrEmpty(sTemplate) Then
         Try
             sTemplate = ThisApplication.FileManager.GetTemplateFile(kDrawingDocumentObject)
-                ' <-- CONFIRM: GetTemplateFile signature/overload on your Inventor version if this throws
         Catch ex As Exception
             MessageBox.Show("Could not auto-resolve a default drawing template. " & _
-                "Set TemplatePath at the top of the rule to a valid .idw file and re-run.", "Template not found")
+                "Set TemplatePath at the top of the rule and re-run.", "Template not found")
             Exit Sub
         End Try
     End If
 
     If Not System.IO.File.Exists(sTemplate) Then
-        MessageBox.Show("Template file does not exist:" & vbCrLf & sTemplate & vbCrLf & _
-            "Set TemplatePath at the top of the rule to a valid .idw file and re-run.", "Bad template path")
+        MessageBox.Show("Template file does not exist:" & vbCrLf & sTemplate, "Bad template path")
         Exit Sub
     End If
 
@@ -78,53 +115,75 @@ Sub Main()
         oDrawDoc = ThisApplication.Documents.Add(kDrawingDocumentObject, sTemplate, True)
     Catch ex As Exception
         MessageBox.Show("Documents.Add rejected this template file:" & vbCrLf & sTemplate & vbCrLf & _
-            vbCrLf & "File exists but Inventor won't accept it as a drawing template — likely it's the " & _
-            "wrong document type (e.g. GetTemplateFile returned a part/assembly template instead of a " & _
-            "drawing one), or it's not a template at all. Set TemplatePath at the top of the rule to a " & _
-            "path you've confirmed manually (File > New > hover the drawing icon for the tooltip path), " & _
-            "and re-run.", "Documents.Add failed")
+            ex.Message, "Documents.Add failed")
         Exit Sub
     End Try
     Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
 
-    ' ---------------- SHEET 1 : MAIN ASSEMBLY (created first -> stays sheet 1, avoids any reordering API) ----------------
+    ' ---------------- SHEET 1 : MAIN ASSEMBLY ----------------
     Dim oMainSheet As Sheet = oDrawDoc.ActiveSheet
     oMainSheet.Name = "MAIN ASSEMBLY"
 
-    Dim oMainPos As Point2d = oTG.CreatePoint2d(oMainSheet.Width * 0.35, oMainSheet.Height * 0.55)
-    Dim oMainView As DrawingView = oMainSheet.DrawingViews.AddBaseView( _
-        oAsmDoc, oMainPos, ViewScale, ViewOrient, ViewStyle, "MAIN ASSEMBLY")
-
-    Dim oPLPos As Point2d = oTG.CreatePoint2d(oMainSheet.Width - 1, oMainSheet.Height - 1)
-    Dim oPartsList As PartsList = Nothing
+    ' Remember the template's border + title block ("Standardrahmen" / "Glatt_Norm_eng")
+    ' so sheets 2..N can reuse them — baseline run left new sheets bare.
+    Dim oBorderDef As BorderDefinition = Nothing
+    Dim oTBDef As TitleBlockDefinition = Nothing
     Try
-        ' Both kPartsOnlyPartsListType and kAllLevelsPartsListLevel came back as "used before assigned" —
-        ' that's what happens when an unrecognized identifier is silently auto-declared rather than a
-        ' hard "name not found" error. Revised theory: PartsLists.Add takes Boolean flags here, not enums.
-        ' FirstLevelOnly=False (walk all levels), PartsOnlyList=True (parts only, matches original intent).
-        ' <-- CONFIRM: type "oMainSheet.PartsLists.Add(" in the iLogic editor and read the IntelliSense
-        '     tooltip for the real parameter list/types — faster ground truth than another guess-run cycle.
-        oPartsList = oMainSheet.PartsLists.Add(oMainView, oPLPos, False, True)
+        If Not (oMainSheet.Border Is Nothing) Then oBorderDef = oMainSheet.Border.Definition
+        If Not (oMainSheet.TitleBlock Is Nothing) Then oTBDef = oMainSheet.TitleBlock.Definition
     Catch ex As Exception
-        Logger.Warn("PartsLists.Add failed: " & ex.Message & ". Check the real parameter list via " & _
-            "IntelliSense and update this line. Continuing without a parts list / balloons.")
+        Logger.Warn("Could not read border/title block definitions from sheet 1: " & ex.Message)
     End Try
 
-    If Not (oPartsList Is Nothing) Then
-        AutoBalloon(oMainSheet, oMainView)
+    ' Main view: create 1:1, measure, then fit into the area left of the parts list strip
+    Dim oMainView As DrawingView = AddViewSafe(oMainSheet, oAsmDoc, _
+        oTG.CreatePoint2d(oMainSheet.Width * 0.4, oMainSheet.Height * 0.55), 1.0, _
+        kIsoTopRightViewOrientation, MainStyle, "MAIN ASSEMBLY")
+
+    Dim oPartsList As PartsList = Nothing
+    If Not (oMainView Is Nothing) Then
+        Dim regionW As Double = oMainSheet.Width - MarginL - MarginR - PartsListWidth
+        Dim regionH As Double = oMainSheet.Height - MarginB - MarginT
+        Dim sFit As Double = Math.Min(regionW / Math.Max(oMainView.Width, 0.001), _
+                                      regionH / Math.Max(oMainView.Height, 0.001))
+        If sFit > 0 Then
+            Dim s As Double = SnapScale(sFit)
+            SetScaleSafe(oMainView, s, "MAIN ASSEMBLY")
+            SetPosSafe(oMainView, MarginL + regionW / 2, MarginB + regionH / 2)
+            Logger.Info("Main assembly view scale set to " & s)
+        End If
+
+        ' Parts list. Third arg is PartsListLevelEnum as a raw value:
+        '   46594 = kPartsOnly (all leaf parts, flattened — what we want here)
+        '   46593 = kStructured (first-level items)
+        ' Numeric-value pattern confirmed in working code (JRForman/createSheets).
+        ' Placement point = TOP-LEFT corner of the table; it grows downward.
+        Dim oPLPos As Point2d = oTG.CreatePoint2d(oMainSheet.Width - MarginR - PartsListWidth, _
+                                                  oMainSheet.Height - 1.2)
+        Try
+            oPartsList = oMainSheet.PartsLists.Add(oMainView, oPLPos, 46594)
+        Catch ex As Exception
+            Logger.Warn("PartsLists.Add(kPartsOnly=46594) failed: " & ex.Message & _
+                " — retrying with the default level.")
+            Try
+                oPartsList = oMainSheet.PartsLists.Add(oMainView, oPLPos)
+            Catch ex2 As Exception
+                Logger.Warn("PartsLists.Add failed entirely: " & ex2.Message & _
+                    ". Continuing without parts list / balloons.")
+            End Try
+        End Try
+
+        If Not (oPartsList Is Nothing) Then
+            AutoBalloonView(oMainSheet, oMainView, oAsmDoc)
+        End If
     End If
 
     ' ---------------- ONE SHEET PER UNIQUE PART ----------------
-    Dim oDoc As Document
     Dim failCount As Integer = 0
-    For Each oDoc In uniqueParts.Values
+    For Each oDoc As Document In uniqueParts.Values
         Try
-            Dim oSheet As Sheet = oDrawDoc.Sheets.Add()
-            oSheet.Name = Left(oDoc.DisplayName, 30)   ' <-- CONFIRM sheet-name char limit on your version
-
-            Dim oPos As Point2d = oTG.CreatePoint2d(oSheet.Width / 2, oSheet.Height / 2)
-            Dim oView As DrawingView = oSheet.DrawingViews.AddBaseView( _
-                oDoc, oPos, ViewScale, ViewOrient, ViewStyle, oDoc.DisplayName)
+            BuildPartSheet(oDrawDoc, oDoc, oBorderDef, oTBDef, OrthoStyle, IsoStyle, _
+                MarginL, MarginR, MarginT, MarginB, ViewGap)
         Catch ex As Exception
             failCount = failCount + 1
             Logger.Warn("Sheet failed for part '" & oDoc.DisplayName & "': " & ex.Message)
@@ -135,21 +194,192 @@ Sub Main()
     End If
 
     ' ---------------- SAVE ----------------
-    oDrawDoc.SaveAs(OutputPath, False)
+    oDrawDoc.SaveAs(OutputPath, False)   ' confirmed working with DWG-native doc in baseline run
     Logger.Info("Saved: " & OutputPath)
 
 End Sub
 
 
 ' =====================================================================
-Sub CollectLeafParts(oRows As BOMRowsEnumerator, ByRef dict As Dictionary(Of String, Document))
-' Recurses structured BOM rows, keeps one Document per unique LEAF part (skips
-' subassembly container rows, recurses into their ChildRows).
+Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
+        oBorderDef As BorderDefinition, oTBDef As TitleBlockDefinition, _
+        OrthoStyle As DrawingViewStyleEnum, IsoStyle As DrawingViewStyleEnum, _
+        MarginL As Double, MarginR As Double, MarginT As Double, MarginB As Double, _
+        ViewGap As Double)
+' One sheet per part: FRONT / TOP / RIGHT third-angle arrangement + ISO, at a
+' common standard scale that fits the sheet.
 '
-' <-- UNVERIFIED: behavior of BOMRow.ChildRows when StructuredViewFirstLevelOnly = False.
-'     On some Inventor versions BOMRows may already return the full flattened tree,
-'     making this recursion a harmless no-op. Sanity-check uniqueParts.Count against
-'     a manual part count on first run.
+' Third angle is enforced by PLACEMENT of independent base views (TOP directly
+' ABOVE the front view, RIGHT view to the RIGHT of it) with explicit
+' orientations — deliberately not AddProjectedView, whose direction convention
+' would follow the template's (likely first-angle DIN) drafting standard.
+'
+' NOTE: kFrontViewOrientation follows how each part was modeled in its own
+' coordinate system — "front" is the part's XY-plane-facing view, which may not
+' be the face a drafter would pick. Consistent, but review on first run.
+
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim oSheet As Sheet = oDrawDoc.Sheets.Add()   ' bare Add() confirmed working in baseline run
+
+    Try
+        oSheet.Name = Left(System.IO.Path.GetFileNameWithoutExtension(oPartDoc.FullFileName), 30)
+    Catch ex As Exception
+        Logger.Warn("Could not rename sheet for '" & oPartDoc.DisplayName & "': " & ex.Message)
+    End Try
+
+    ApplySheetFormat(oSheet, oBorderDef, oTBDef)
+
+    ' Create all four views 1:1 mid-sheet (they will overflow the sheet edges —
+    ' harmless and transient), measure, then rescale + position.
+    Dim oC As Point2d = oTG.CreatePoint2d(oSheet.Width / 2, oSheet.Height / 2)
+    Dim vFront As DrawingView = AddViewSafe(oSheet, oPartDoc, oC, 1.0, kFrontViewOrientation, OrthoStyle, "FRONT")
+    Dim vTop   As DrawingView = AddViewSafe(oSheet, oPartDoc, oC, 1.0, kTopViewOrientation, OrthoStyle, "TOP")
+    Dim vRight As DrawingView = AddViewSafe(oSheet, oPartDoc, oC, 1.0, kRightViewOrientation, OrthoStyle, "RIGHT")
+    Dim vIso   As DrawingView = AddViewSafe(oSheet, oPartDoc, oC, 1.0, kIsoTopRightViewOrientation, IsoStyle, "ISO")
+
+    If vFront Is Nothing And vTop Is Nothing And vRight Is Nothing And vIso Is Nothing Then
+        Logger.Warn("No views could be created for '" & oPartDoc.DisplayName & "' — sheet left empty.")
+        Exit Sub
+    End If
+
+    ' At scale 1:1, view Width/Height (cm on paper) == model extents (cm).
+    ' Grid: left column = front with top stacked above; right column = right with iso above.
+    Dim colL As Double = Math.Max(ViewW(vFront), ViewW(vTop))
+    Dim colR As Double = Math.Max(ViewW(vRight), ViewW(vIso))
+    Dim rowB As Double = Math.Max(ViewH(vFront), ViewH(vRight))
+    Dim rowT As Double = Math.Max(ViewH(vTop), ViewH(vIso))
+    If (colL + colR) <= 0 Or (rowB + rowT) <= 0 Then Exit Sub
+
+    Dim usableW As Double = oSheet.Width - MarginL - MarginR
+    Dim usableH As Double = oSheet.Height - MarginB - MarginT
+    Dim sFit As Double = Math.Min((usableW - ViewGap) / (colL + colR), _
+                                  (usableH - ViewGap) / (rowB + rowT))
+    If sFit <= 0 Then Exit Sub
+    Dim s As Double = SnapScale(sFit)
+
+    SetScaleSafe(vFront, s, "FRONT")
+    SetScaleSafe(vTop, s, "TOP")
+    SetScaleSafe(vRight, s, "RIGHT")
+    SetScaleSafe(vIso, s, "ISO")
+
+    ' Re-measure at final scale, then place the third-angle grid:
+    '   TOP shares the front view's vertical centerline (directly above it),
+    '   RIGHT shares the front view's horizontal centerline (directly right of it).
+    colL = Math.Max(ViewW(vFront), ViewW(vTop))
+    colR = Math.Max(ViewW(vRight), ViewW(vIso))
+    rowB = Math.Max(ViewH(vFront), ViewH(vRight))
+    rowT = Math.Max(ViewH(vTop), ViewH(vIso))
+
+    Dim xL As Double = MarginL + colL / 2
+    Dim xR As Double = MarginL + colL + ViewGap + colR / 2
+    Dim yB As Double = MarginB + rowB / 2
+    Dim yT As Double = MarginB + rowB + ViewGap + rowT / 2
+
+    SetPosSafe(vFront, xL, yB)
+    SetPosSafe(vTop, xL, yT)
+    SetPosSafe(vRight, xR, yB)
+    SetPosSafe(vIso, xR, yT)
+
+    Logger.Info("Sheet '" & oSheet.Name & "': scale " & s)
+
+End Sub
+
+
+' =====================================================================
+Sub ApplySheetFormat(oSheet As Sheet, oBorderDef As BorderDefinition, oTBDef As TitleBlockDefinition)
+' Puts the template's border + title block on a freshly added (bare) sheet.
+' AddDefaultBorder and AddTitleBlock(<name string>,,<prompts>) are confirmed
+' in working code (createSheets); the definition-OBJECT overloads tried first
+' are unverified on this build, hence the fallback chains.
+
+    Try
+        If Not (oBorderDef Is Nothing) Then
+            oSheet.AddBorder(oBorderDef)
+        Else
+            oSheet.AddDefaultBorder()
+        End If
+    Catch
+        Try
+            oSheet.AddDefaultBorder()
+        Catch ex As Exception
+            Logger.Warn("No border could be added to sheet '" & oSheet.Name & "': " & ex.Message)
+        End Try
+    End Try
+
+    If Not (oTBDef Is Nothing) Then
+        Try
+            oSheet.AddTitleBlock(oTBDef)
+        Catch
+            Try
+                oSheet.AddTitleBlock(oTBDef.Name)
+            Catch ex As Exception
+                Logger.Warn("Title block could not be added to sheet '" & oSheet.Name & "': " & ex.Message)
+            End Try
+        End Try
+    End If
+
+End Sub
+
+
+' =====================================================================
+Function AddViewSafe(oSheet As Sheet, oDoc As Document, oPos As Point2d, dScale As Double, _
+        eOrient As ViewOrientationTypeEnum, eStyle As DrawingViewStyleEnum, sTag As String) As DrawingView
+    Try
+        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle)
+    Catch ex As Exception
+        Logger.Warn("View '" & sTag & "' failed on sheet '" & oSheet.Name & "': " & ex.Message)
+        Return Nothing
+    End Try
+End Function
+
+
+Sub SetScaleSafe(oV As DrawingView, s As Double, sTag As String)
+    If oV Is Nothing Then Exit Sub
+    Try
+        oV.Scale = s
+    Catch ex As Exception
+        Logger.Warn("Could not set scale on view '" & sTag & "': " & ex.Message)
+    End Try
+End Sub
+
+
+Sub SetPosSafe(oV As DrawingView, x As Double, y As Double)
+    If oV Is Nothing Then Exit Sub
+    Try
+        oV.Position = ThisApplication.TransientGeometry.CreatePoint2d(x, y)
+    Catch ex As Exception
+        Logger.Warn("Could not position a view: " & ex.Message)
+    End Try
+End Sub
+
+
+Function ViewW(oV As DrawingView) As Double
+    If oV Is Nothing Then Return 0
+    Return oV.Width
+End Function
+
+
+Function ViewH(oV As DrawingView) As Double
+    If oV Is Nothing Then Return 0
+    Return oV.Height
+End Function
+
+
+Function SnapScale(sRaw As Double) As Double
+' Largest standard (DIN ISO 5455-ish) scale that still fits.
+    Dim stdScales() As Double = {10, 5, 2, 1, 1 / 2, 1 / 2.5, 1 / 5, 1 / 10, 1 / 20, 1 / 50, 1 / 100, 1 / 200}
+    For Each s As Double In stdScales
+        If s <= sRaw Then Return s
+    Next
+    Return sRaw   ' smaller than 1:200 — use the raw fit scale
+End Function
+
+
+' =====================================================================
+Sub CollectLeafParts(oRows As BOMRowsEnumerator, ByRef dict As Dictionary(Of String, Document))
+' Recurses structured BOM rows, keeps one Document per unique LEAF part
+' (skips subassembly container rows, recurses into their ChildRows).
+' Confirmed working in baseline run — part count matched the model.
 
     Dim oRow As BOMRow
     For Each oRow In oRows
@@ -168,24 +398,80 @@ End Sub
 
 
 ' =====================================================================
-Sub AutoBalloon(oSheet As Sheet, oView As DrawingView)
-' <-- UNVERIFIED BLOCK — no single documented API cleanly bulk-balloons a view across
-' all Inventor releases. To get a confirmed call:
-'   1. Tools > Macro > Record Macro
-'   2. Manually run Annotate > Table panel > Auto Balloon > select oView >
-'      "All components in view" > OK
-'   3. Stop recording, open the generated VBA macro, copy the exact call it made
-'   4. Paste that call below, replacing the placeholder line
-'
-' Wrapped in Try/Catch so the rest of the rule (sheets, BOM, save) still completes
-' even if this specific call fails on your release.
+Sub AutoBalloonView(oSheet As Sheet, oView As DrawingView, oAsmDoc As AssemblyDocument)
+' Places one balloon per unique part on the given assembly view, arranged on a
+' ring just outside the view boundary, leader attached to a real model edge.
+' Replaces the old CommandManager placeholder — the macro recorder needed to
+' discover the command name does not exist in this Inventor build, and this
+' DrawingCurves + Balloons.Add route is the documented API path anyway.
+' Balloon numbers come from the drawing BOM, so they match the parts list.
 
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim done As New HashSet(Of String)
+    Dim ballooned As Integer = 0
+
+    ' Leaf occurrences = actual parts, matching the Parts-Only list.
+    ' Falls back to first-level occurrences if AllLeafOccurrences is unavailable.
+    Dim oOccs As Object
     Try
-        ThisApplication.CommandManager.ControlDefinitions.Item("PartsList:AutoBalloonAllCmd").Execute2(True)
-    Catch ex As Exception
-        Logger.Warn("Auto-balloon command name not confirmed for this Inventor release. " & _
-            "Run Annotate > Auto Balloon manually on sheet '" & oSheet.Name & "', then re-save. " & _
-            "Update AutoBalloon() once the exact control-def name is confirmed via macro recording.")
+        oOccs = oAsmDoc.ComponentDefinition.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oAsmDoc.ComponentDefinition.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — ballooning first-level occurrences only.")
     End Try
+
+    Dim vc As Point2d = oView.Position
+    Dim ringR As Double = Math.Max(oView.Width, oView.Height) / 2 + 2.0
+
+    For Each oOcc As ComponentOccurrence In oOccs
+        Try
+            If oOcc.Suppressed Then Continue For
+            Dim key As String = oOcc.ReferencedDocumentDescriptor.FullDocumentName
+            If done.Contains(key) Then Continue For
+
+            Dim oCurves As DrawingCurvesEnumerator = oView.DrawingCurves(oOcc)
+            If oCurves.Count = 0 Then Continue For   ' part not visible in this view
+
+            ' First curve that yields a usable attach point (closed curves like
+            ' circles have no Mid/StartPoint — fall back to CenterPoint).
+            Dim oCurve As DrawingCurve = Nothing
+            Dim oAttach As Point2d = Nothing
+            For Each c As DrawingCurve In oCurves
+                Dim p As Point2d = c.MidPoint
+                If p Is Nothing Then p = c.StartPoint
+                If p Is Nothing Then p = c.CenterPoint
+                If Not (p Is Nothing) Then
+                    oCurve = c
+                    oAttach = p
+                    Exit For
+                End If
+            Next
+            If oAttach Is Nothing Then Continue For
+
+            ' Balloon sits on a ring outside the view, radially out from the
+            ' view centre through the attach point, clamped onto the sheet.
+            Dim dx As Double = oAttach.X - vc.X
+            Dim dy As Double = oAttach.Y - vc.Y
+            Dim mag As Double = Math.Sqrt(dx * dx + dy * dy)
+            If mag < 0.001 Then
+                dx = 0 : dy = 1 : mag = 1
+            End If
+            Dim bx As Double = Math.Min(Math.Max(vc.X + dx / mag * ringR, 1), oSheet.Width - 1)
+            Dim by As Double = Math.Min(Math.Max(vc.Y + dy / mag * ringR, 1), oSheet.Height - 1)
+
+            Dim oIntent As GeometryIntent = oSheet.CreateGeometryIntent(oCurve, oAttach)
+            Dim oLeader As ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection
+            oLeader.Add(oTG.CreatePoint2d(bx, by))
+            oLeader.Add(oIntent)
+            oSheet.Balloons.Add(oLeader)
+
+            done.Add(key)
+            ballooned = ballooned + 1
+        Catch ex As Exception
+            Logger.Warn("Balloon failed for occurrence '" & oOcc.Name & "': " & ex.Message)
+        End Try
+    Next
+
+    Logger.Info(ballooned & " balloon(s) placed on sheet '" & oSheet.Name & "'.")
 
 End Sub
