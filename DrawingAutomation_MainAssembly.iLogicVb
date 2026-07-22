@@ -121,6 +121,38 @@
 '     don't have any dimensions flagged for export, nothing will appear
 '     here no matter what this rule does — that's a modeling-side setting,
 '     not something drawing automation can create from scratch.
+'
+'  v6 — a COMPILE error (not a runtime exception) surfaced a new, more
+'  serious risk class. v5's "oSheet.AddTitleBlock()" with zero arguments
+'  didn't just fail — it triggered a hard compile error ("Argument not
+'  specified for parameter 'TitleBlockDefinition'"), which blocks the
+'  ENTIRE rule from running at all. Try/Catch cannot protect against
+'  this: the rule never starts executing, so there's no partial progress,
+'  no sheets, not even the first BOM-count log line — strictly worse than
+'  any runtime E_INVALIDARG or "member not found" seen so far, both of
+'  which at least let the rest of the rule keep going.
+'   * Distinction to keep in mind for anything added later: wrong
+'     enum/identifier names AND wrong argument COUNTS against a method
+'     with a known strongly-typed signature are COMPILE-time failures
+'     (unrescuable by Try/Catch — the whole rule aborts silently from the
+'     user's point of view, before Logger ever runs). Wrong argument
+'     VALUES and unknown MEMBER names on an otherwise-valid object are
+'     RUNTIME failures (both already seen and safely caught: E_INVALIDARG
+'     on AddTitleBlock's value, "member not found" on Sheet.BendTables).
+'   * The error message itself gave the real signature verbatim — as good
+'     as an IntelliSense tooltip, since it's the compiler reporting what
+'     it actually resolved: AddTitleBlock(TitleBlockDefinition As Object,
+'     [TitleBlockLocation As Object], [PromptStrings As Object]). First
+'     parameter required, hence the crash.
+'   * ApplySheetFormat: removed the bare AddTitleBlock() attempt entirely.
+'     Down to one mechanism now — a TitleBlockDefinition freshly looked up
+'     from the document's own TitleBlockDefinitions collection by name —
+'     which was never actually exercised before, since the compile error
+'     always aborted the rule before reaching it.
+'   * Every other call in the file was re-audited specifically against
+'     this risk (right method, wrong argument count) — this was the only
+'     offender; everything else has either run cleanly across multiple
+'     real executions already or mirrors a call shape that has.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -528,25 +560,32 @@ End Function
 Sub ApplySheetFormat(oDrawDoc As DrawingDocument, oSheet As Sheet, sTBName As String)
 ' Puts sheet 1's border + title block on a freshly added (bare) sheet.
 '
-' CONFIRMED from a real run: AddDefaultBorder() succeeds every time — no
-' changes needed there. AddTitleBlock has now failed with the SAME
-' E_INVALIDARG across three different attempts (a TitleBlockDefinition
-' object captured off sheet 1's applied instance; that object's .Name as a
-' plain string; and the same string via the ThisDrawing wrapper) — so the
-' method exists and takes something, just not what's been tried so far.
-' The ThisDrawing wrapper route is gone: confirmed (not just suspected)
-' architecturally unusable here — see AutoBalloonView and the v5 header note.
+' CONFIRMED from real runs: AddDefaultBorder() succeeds every time — no
+' changes needed there.
 '
-' Two more mechanisms tried before asking for IntelliSense:
-'   1. Parameterless AddTitleBlock() — uses the document's own default title
-'      block definition, sidestepping name/object lookup entirely.
-'   2. A FRESH TitleBlockDefinition looked up from the DOCUMENT's own
-'      TitleBlockDefinitions collection by name, rather than reusing the
-'      object/string captured off sheet 1's already-applied instance — those
-'      may not be interchangeable even though they report the same .Name.
-' <-- If both of these also fail: type "oSheet.AddTitleBlock(" in the iLogic
-'     editor and read the IntelliSense tooltip for the real signature —
-'     three guesses failing the same way is a signal to stop guessing.
+' AddTitleBlock's REAL signature, straight from an Inventor compiler error
+' (as good as an IntelliSense tooltip — this is the actual method the
+' compiler resolved, not a guess):
+'   Public Function AddTitleBlock(TitleBlockDefinition As Object,
+'       [TitleBlockLocation As Object], [PromptStrings As Object]) As Inventor.TitleBlock
+' The first parameter is REQUIRED. Calling it with zero arguments was not
+' just wrong, it was a COMPILE error ("Argument not specified for parameter
+' 'TitleBlockDefinition'"), which blocks the ENTIRE rule from running at
+' all — Try/Catch cannot protect against a compile failure, since the rule
+' never starts executing (not even the BOM-count log line got printed).
+' That's a materially worse failure mode than any runtime E_INVALIDARG or
+' "member not found" seen elsewhere in this file, and it's now removed.
+'
+' Remaining approach: a TitleBlockDefinition freshly looked up from the
+' DOCUMENT's own TitleBlockDefinitions collection by name — genuinely
+' untested until now, since the compile error above always aborted the rule
+' before reaching it. sTBName as a plain string is not retried here — it has
+' already failed via a real RUNTIME E_INVALIDARG twice (v2's oTBDef.Name,
+' v3/v4's sTBName directly).
+' <-- If this also fails: type "oSheet.AddTitleBlock(" in the iLogic editor
+'     and read the IntelliSense tooltip — expect the same signature as
+'     above, but the unused TitleBlockLocation parameter may be worth
+'     passing too if a plain definition object alone isn't enough.
 
     Try
         oSheet.AddDefaultBorder()
@@ -554,24 +593,14 @@ Sub ApplySheetFormat(oDrawDoc As DrawingDocument, oSheet As Sheet, sTBName As St
         Logger.Warn("No border could be added to sheet '" & oSheet.Name & "': " & ex.Message)
     End Try
 
-    Dim tbDone As Boolean = False
-    Try
-        oSheet.AddTitleBlock()
-        tbDone = True
-    Catch ex As Exception
-        Logger.Warn("AddTitleBlock() (document default) failed on '" & oSheet.Name & "': " & ex.Message)
-    End Try
-
-    If Not tbDone AndAlso Not String.IsNullOrEmpty(sTBName) Then
+    If Not String.IsNullOrEmpty(sTBName) Then
         Try
             Dim oTBDef As TitleBlockDefinition = oDrawDoc.TitleBlockDefinitions.Item(sTBName)
             oSheet.AddTitleBlock(oTBDef)
-            tbDone = True
         Catch ex As Exception
             Logger.Warn("AddTitleBlock(TitleBlockDefinitions.Item(""" & sTBName & """)) failed on '" & _
-                oSheet.Name & "': " & ex.Message & ". Title block has now failed 3 different ways — " & _
-                "type ""oSheet.AddTitleBlock("" in the iLogic editor and read the IntelliSense tooltip " & _
-                "for the real signature, then update ApplySheetFormat().")
+                oSheet.Name & "': " & ex.Message & ". Type ""oSheet.AddTitleBlock("" in the iLogic " & _
+                "editor and read the IntelliSense tooltip for the real signature if this keeps failing.")
         End Try
     End If
 
