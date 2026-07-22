@@ -1,0 +1,191 @@
+' =====================================================================
+'  DRAWING AUTOMATION — Main Assembly
+'  Output: single multi-sheet .idw
+'    Sheet 1        = MAIN ASSEMBLY view + structured Parts-Only BOM + balloons
+'    Sheet 2..N     = one sheet per UNIQUE part (deduped by file), base iso view
+'
+'  Run with the main .iam as the ACTIVE document.
+'  Structured as External Rule (Sub Main + helper Subs) to avoid the
+'  "Rule needs a Sub Main() and End Sub" parser error.
+' =====================================================================
+
+Imports System.Collections.Generic
+
+Sub Main()
+
+    ' ---------------- CONSTANTS — EDIT THESE ----------------
+    Dim TemplatePath As String = "C:\VAULTWorkingFolder\Engineering\CAD Settings\TemplatesINV2024\acadglatt07.dwg"
+        ' confirmed working template — leave blank instead to fall back to Inventor's configured default
+    Dim OutputExt    As String = System.IO.Path.GetExtension(TemplatePath)   ' matches template format (.dwg here)
+    Dim OutputPath   As String = ThisDoc.Path & "\" & ThisDoc.FileName(False) & "_DRAWINGS" & OutputExt
+    Dim ViewScale    As Double = 1.0
+    Dim ViewOrient   As ViewOrientationTypeEnum = kIsoTopRightViewOrientation
+    Dim ViewStyle    As DrawingViewStyleEnum = kShadedDrawingViewStyle
+        ' <-- was kShadedWithHiddenEdgesDrawingViewStyle (not a real member) — this one is high-confidence,
+        '     it's the most commonly used DrawingViewStyleEnum value in Inventor API samples
+
+    ' ---------------- VALIDATE ACTIVE DOC ----------------
+    If ThisDoc.Document.DocumentType <> kAssemblyDocumentObject Then
+        MessageBox.Show("Open the main assembly (.iam) and re-run.", "Wrong document type")
+        Exit Sub
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = ThisDoc.Document
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+    Try
+        If TypeOf oCompDef Is WeldmentComponentDefinition Then
+            Logger.Info("Assembly is a Weldment — Parts-Only BOM used below. " & _
+                "Switch to Cut-List BOM manually if you want stock-length callouts instead.")
+        End If
+    Catch
+        ' Advisory only — WeldmentComponentDefinition check unavailable on this API surface, skip
+    End Try
+
+    ' ---------------- BUILD UNIQUE PART LIST FROM BOM ----------------
+    Dim oBOM As BOM = oCompDef.BOM
+    oBOM.StructuredViewEnabled = True
+    oBOM.StructuredViewFirstLevelOnly = False
+    Dim oBOMView As BOMView = oBOM.BOMViews.Item("Structured")
+
+    Dim uniqueParts As New Dictionary(Of String, Document)
+    CollectLeafParts(oBOMView.BOMRows, uniqueParts)
+    Logger.Info(uniqueParts.Count & " unique part(s) found in BOM.")
+
+    ' ---------------- CREATE DRAWING DOC ----------------
+    Dim sTemplate As String = TemplatePath
+    If String.IsNullOrEmpty(sTemplate) Then
+        Try
+            sTemplate = ThisApplication.FileManager.GetTemplateFile(kDrawingDocumentObject)
+                ' <-- CONFIRM: GetTemplateFile signature/overload on your Inventor version if this throws
+        Catch ex As Exception
+            MessageBox.Show("Could not auto-resolve a default drawing template. " & _
+                "Set TemplatePath at the top of the rule to a valid .idw file and re-run.", "Template not found")
+            Exit Sub
+        End Try
+    End If
+
+    If Not System.IO.File.Exists(sTemplate) Then
+        MessageBox.Show("Template file does not exist:" & vbCrLf & sTemplate & vbCrLf & _
+            "Set TemplatePath at the top of the rule to a valid .idw file and re-run.", "Bad template path")
+        Exit Sub
+    End If
+
+    Logger.Info("Resolved template: " & sTemplate)
+
+    Dim oDrawDoc As DrawingDocument
+    Try
+        oDrawDoc = ThisApplication.Documents.Add(kDrawingDocumentObject, sTemplate, True)
+    Catch ex As Exception
+        MessageBox.Show("Documents.Add rejected this template file:" & vbCrLf & sTemplate & vbCrLf & _
+            vbCrLf & "File exists but Inventor won't accept it as a drawing template — likely it's the " & _
+            "wrong document type (e.g. GetTemplateFile returned a part/assembly template instead of a " & _
+            "drawing one), or it's not a template at all. Set TemplatePath at the top of the rule to a " & _
+            "path you've confirmed manually (File > New > hover the drawing icon for the tooltip path), " & _
+            "and re-run.", "Documents.Add failed")
+        Exit Sub
+    End Try
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+
+    ' ---------------- SHEET 1 : MAIN ASSEMBLY (created first -> stays sheet 1, avoids any reordering API) ----------------
+    Dim oMainSheet As Sheet = oDrawDoc.ActiveSheet
+    oMainSheet.Name = "MAIN ASSEMBLY"
+
+    Dim oMainPos As Point2d = oTG.CreatePoint2d(oMainSheet.Width * 0.35, oMainSheet.Height * 0.55)
+    Dim oMainView As DrawingView = oMainSheet.DrawingViews.AddBaseView( _
+        oAsmDoc, oMainPos, ViewScale, ViewOrient, ViewStyle, "MAIN ASSEMBLY")
+
+    Dim oPLPos As Point2d = oTG.CreatePoint2d(oMainSheet.Width - 1, oMainSheet.Height - 1)
+    Dim oPartsList As PartsList = Nothing
+    Try
+        ' Both kPartsOnlyPartsListType and kAllLevelsPartsListLevel came back as "used before assigned" —
+        ' that's what happens when an unrecognized identifier is silently auto-declared rather than a
+        ' hard "name not found" error. Revised theory: PartsLists.Add takes Boolean flags here, not enums.
+        ' FirstLevelOnly=False (walk all levels), PartsOnlyList=True (parts only, matches original intent).
+        ' <-- CONFIRM: type "oMainSheet.PartsLists.Add(" in the iLogic editor and read the IntelliSense
+        '     tooltip for the real parameter list/types — faster ground truth than another guess-run cycle.
+        oPartsList = oMainSheet.PartsLists.Add(oMainView, oPLPos, False, True)
+    Catch ex As Exception
+        Logger.Warn("PartsLists.Add failed: " & ex.Message & ". Check the real parameter list via " & _
+            "IntelliSense and update this line. Continuing without a parts list / balloons.")
+    End Try
+
+    If Not (oPartsList Is Nothing) Then
+        AutoBalloon(oMainSheet, oMainView)
+    End If
+
+    ' ---------------- ONE SHEET PER UNIQUE PART ----------------
+    Dim oDoc As Document
+    Dim failCount As Integer = 0
+    For Each oDoc In uniqueParts.Values
+        Try
+            Dim oSheet As Sheet = oDrawDoc.Sheets.Add()
+            oSheet.Name = Left(oDoc.DisplayName, 30)   ' <-- CONFIRM sheet-name char limit on your version
+
+            Dim oPos As Point2d = oTG.CreatePoint2d(oSheet.Width / 2, oSheet.Height / 2)
+            Dim oView As DrawingView = oSheet.DrawingViews.AddBaseView( _
+                oDoc, oPos, ViewScale, ViewOrient, ViewStyle, oDoc.DisplayName)
+        Catch ex As Exception
+            failCount = failCount + 1
+            Logger.Warn("Sheet failed for part '" & oDoc.DisplayName & "': " & ex.Message)
+        End Try
+    Next
+    If failCount > 0 Then
+        Logger.Warn(failCount & " part sheet(s) failed — see warnings above. Drawing still saved with the rest.")
+    End If
+
+    ' ---------------- SAVE ----------------
+    oDrawDoc.SaveAs(OutputPath, False)
+    Logger.Info("Saved: " & OutputPath)
+
+End Sub
+
+
+' =====================================================================
+Sub CollectLeafParts(oRows As BOMRowsEnumerator, ByRef dict As Dictionary(Of String, Document))
+' Recurses structured BOM rows, keeps one Document per unique LEAF part (skips
+' subassembly container rows, recurses into their ChildRows).
+'
+' <-- UNVERIFIED: behavior of BOMRow.ChildRows when StructuredViewFirstLevelOnly = False.
+'     On some Inventor versions BOMRows may already return the full flattened tree,
+'     making this recursion a harmless no-op. Sanity-check uniqueParts.Count against
+'     a manual part count on first run.
+
+    Dim oRow As BOMRow
+    For Each oRow In oRows
+        Dim oDef As ComponentDefinition = oRow.ComponentDefinitions.Item(1)
+        Dim oPartDoc As Document = oDef.Document
+
+        If oPartDoc.DocumentType = kPartDocumentObject Then
+            Dim key As String = oPartDoc.FullFileName
+            If Not dict.ContainsKey(key) Then dict.Add(key, oPartDoc)
+        ElseIf Not (oRow.ChildRows Is Nothing) AndAlso oRow.ChildRows.Count > 0 Then
+            CollectLeafParts(oRow.ChildRows, dict)
+        End If
+    Next
+
+End Sub
+
+
+' =====================================================================
+Sub AutoBalloon(oSheet As Sheet, oView As DrawingView)
+' <-- UNVERIFIED BLOCK — no single documented API cleanly bulk-balloons a view across
+' all Inventor releases. To get a confirmed call:
+'   1. Tools > Macro > Record Macro
+'   2. Manually run Annotate > Table panel > Auto Balloon > select oView >
+'      "All components in view" > OK
+'   3. Stop recording, open the generated VBA macro, copy the exact call it made
+'   4. Paste that call below, replacing the placeholder line
+'
+' Wrapped in Try/Catch so the rest of the rule (sheets, BOM, save) still completes
+' even if this specific call fails on your release.
+
+    Try
+        ThisApplication.CommandManager.ControlDefinitions.Item("PartsList:AutoBalloonAllCmd").Execute2(True)
+    Catch ex As Exception
+        Logger.Warn("Auto-balloon command name not confirmed for this Inventor release. " & _
+            "Run Annotate > Auto Balloon manually on sheet '" & oSheet.Name & "', then re-save. " & _
+            "Update AutoBalloon() once the exact control-def name is confirmed via macro recording.")
+    End Try
+
+End Sub
