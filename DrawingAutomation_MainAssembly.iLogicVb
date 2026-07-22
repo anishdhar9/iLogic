@@ -20,17 +20,39 @@
 '     first-angle (typical for DIN templates). Trade-off: views are not
 '     alignment-linked if dragged manually later.
 '   * New sheets get the border + title block from sheet 1 (baseline run
-'     produced bare sheets). AddDefaultBorder / AddTitleBlock(name,,prompts)
-'     are confirmed-in-the-wild calls (createSheets); the definition-object
-'     overloads tried first are wrapped with fallbacks.
+'     produced bare sheets).
 '   * PartsLists.Add third arg is a PartsListLevelEnum passed as raw value:
 '     46594 = kPartsOnly, 46593 = kStructured (numeric values confirmed in
 '     createSheets, which calls Add(view, point, 46593) in production).
 '     Replaces the Boolean-arg guess that failed in the baseline run.
-'   * AutoBalloon: macro recorder does not exist in this Inventor build, so
-'     the CommandManager placeholder is gone. Balloons are now placed with the
-'     documented route: view.DrawingCurves(occurrence) -> attach point ->
-'     Sheet.CreateGeometryIntent -> Sheet.Balloons.Add(leaderPoints).
+'
+'  v3 — folded in Inventor's own iLogic snippet browser for this exact build
+'  (macro recording is unavailable here, so these shipped snippets are the
+'  best available ground truth — equivalent to a recorded macro):
+'   * AddViewSafe was silently missing the view-name argument added in v2's
+'     rewrite (regression vs. the working baseline, which named "MAIN
+'     ASSEMBLY" successfully — visible in the browser tree screenshot as
+'     "ANSICHT1:MASTER FILE v1.iam"). Restored.
+'   * ApplySheetFormat now assigns border/title block by NAME through the
+'     ThisDrawing wrapper (Sheet.Border = "name" / .TitleBlock = "name"),
+'     confirmed-real snippets ("Change Border" / "Change Title Block").
+'     Falls back to AddDefaultBorder/AddTitleBlock(name) if the wrapper
+'     doesn't resolve correctly (see CONFIRM note on AutoBalloonView).
+'   * New sheets mirror sheet 1's paper Size (Sheets.Add() does not reliably
+'     inherit it) — matters since the company template is A3.
+'   * AutoBalloon rewritten again: the snippet browser confirms a real bulk
+'     call, View.Balloons.AttachToComponent(occurrenceName) (from "Balloon
+'     Include"/"Balloon Exclude"/"Reattach Balloons"), which is exactly
+'     "auto-balloon this component" without needing to compute any geometry
+'     ourselves. Replaces the v2 CreateGeometryIntent + ring-math version
+'     built from API memory, which is no longer needed.
+'   * Remaining open question: ThisDrawing/ActiveSheet in this wrapper API
+'     normally refers to whatever Inventor considers the active drawing.
+'     This rule is an External Rule launched with the ASSEMBLY as ThisDoc,
+'     which then creates and activates a new DrawingDocument mid-run via
+'     Documents.Add(..., True). Whether ThisDrawing tracks that switch within
+'     the same rule execution is NOT yet confirmed — wrapped in Try/Catch
+'     with a fallback, per the established pattern. Check Logger output.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -124,15 +146,19 @@ Sub Main()
     Dim oMainSheet As Sheet = oDrawDoc.ActiveSheet
     oMainSheet.Name = "MAIN ASSEMBLY"
 
-    ' Remember the template's border + title block ("Standardrahmen" / "Glatt_Norm_eng")
-    ' so sheets 2..N can reuse them — baseline run left new sheets bare.
-    Dim oBorderDef As BorderDefinition = Nothing
-    Dim oTBDef As TitleBlockDefinition = Nothing
+    ' Remember sheet 1's border/title block + paper size ("Standardrahmen" /
+    ' "Glatt_Norm_eng") so sheets 2..N can reuse them — baseline run left new
+    ' sheets bare. Captured by NAME (string), applied via the ThisDrawing
+    ' wrapper in ApplySheetFormat — see v3 note above.
+    Dim sBorderName As String = ""
+    Dim sTBName As String = ""
+    Dim eMainSize As PaperSizeEnum = kA3PaperSize
     Try
-        If Not (oMainSheet.Border Is Nothing) Then oBorderDef = oMainSheet.Border.Definition
-        If Not (oMainSheet.TitleBlock Is Nothing) Then oTBDef = oMainSheet.TitleBlock.Definition
+        If Not (oMainSheet.Border Is Nothing) Then sBorderName = oMainSheet.Border.Name
+        If Not (oMainSheet.TitleBlock Is Nothing) Then sTBName = oMainSheet.TitleBlock.Name
+        eMainSize = oMainSheet.Size
     Catch ex As Exception
-        Logger.Warn("Could not read border/title block definitions from sheet 1: " & ex.Message)
+        Logger.Warn("Could not read border/title block/size from sheet 1: " & ex.Message)
     End Try
 
     ' Main view: create 1:1, measure, then fit into the area left of the parts list strip
@@ -182,7 +208,7 @@ Sub Main()
     Dim failCount As Integer = 0
     For Each oDoc As Document In uniqueParts.Values
         Try
-            BuildPartSheet(oDrawDoc, oDoc, oBorderDef, oTBDef, OrthoStyle, IsoStyle, _
+            BuildPartSheet(oDrawDoc, oDoc, sBorderName, sTBName, eMainSize, OrthoStyle, IsoStyle, _
                 MarginL, MarginR, MarginT, MarginB, ViewGap)
         Catch ex As Exception
             failCount = failCount + 1
@@ -202,7 +228,7 @@ End Sub
 
 ' =====================================================================
 Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
-        oBorderDef As BorderDefinition, oTBDef As TitleBlockDefinition, _
+        sBorderName As String, sTBName As String, eSize As PaperSizeEnum, _
         OrthoStyle As DrawingViewStyleEnum, IsoStyle As DrawingViewStyleEnum, _
         MarginL As Double, MarginR As Double, MarginT As Double, MarginB As Double, _
         ViewGap As Double)
@@ -227,7 +253,13 @@ Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
         Logger.Warn("Could not rename sheet for '" & oPartDoc.DisplayName & "': " & ex.Message)
     End Try
 
-    ApplySheetFormat(oSheet, oBorderDef, oTBDef)
+    Try
+        oSheet.Size = eSize   ' Sheets.Add() does not reliably inherit sheet 1's paper size
+    Catch ex As Exception
+        Logger.Warn("Could not set paper size on sheet '" & oSheet.Name & "': " & ex.Message)
+    End Try
+
+    ApplySheetFormat(oSheet, sBorderName, sTBName)
 
     ' Create all four views 1:1 mid-sheet (they will overflow the sheet edges —
     ' harmless and transient), measure, then rescale + position.
@@ -286,36 +318,40 @@ End Sub
 
 
 ' =====================================================================
-Sub ApplySheetFormat(oSheet As Sheet, oBorderDef As BorderDefinition, oTBDef As TitleBlockDefinition)
-' Puts the template's border + title block on a freshly added (bare) sheet.
-' AddDefaultBorder and AddTitleBlock(<name string>,,<prompts>) are confirmed
-' in working code (createSheets); the definition-OBJECT overloads tried first
-' are unverified on this build, hence the fallback chains.
+Sub ApplySheetFormat(oSheet As Sheet, sBorderName As String, sTBName As String)
+' Puts sheet 1's border + title block on a freshly added (bare) sheet, by NAME.
+' Primary route: ThisDrawing.Sheet(name).Border = "..." / .TitleBlock = "..." —
+' confirmed-real iLogic snippets shipped with this Inventor build (snippet
+' browser: Drawing (classic) > Change Border / Change Title Block).
+' Falls back to the classic AddDefaultBorder/AddTitleBlock(name) route
+' (confirmed working in createSheets) if the wrapper assignment throws — e.g.
+' if ThisDrawing does not resolve to this new document from an External Rule
+' launched off the assembly. <-- CONFIRM which path fired via Logger output.
 
+    Dim usedWrapper As Boolean = False
     Try
-        If Not (oBorderDef Is Nothing) Then
-            oSheet.AddBorder(oBorderDef)
-        Else
-            oSheet.AddDefaultBorder()
-        End If
-    Catch
+        Dim oWSheet As Object = ThisDrawing.Sheet(oSheet.Name)
+        If Not String.IsNullOrEmpty(sBorderName) Then oWSheet.Border = sBorderName
+        If Not String.IsNullOrEmpty(sTBName) Then oWSheet.TitleBlock = sTBName
+        usedWrapper = True
+    Catch ex As Exception
+        Logger.Warn("ThisDrawing.Sheet(...).Border/TitleBlock assignment failed on '" & oSheet.Name & _
+            "': " & ex.Message & " — falling back to classic AddBorder/AddTitleBlock API.")
+    End Try
+
+    If Not usedWrapper Then
         Try
             oSheet.AddDefaultBorder()
         Catch ex As Exception
             Logger.Warn("No border could be added to sheet '" & oSheet.Name & "': " & ex.Message)
         End Try
-    End Try
-
-    If Not (oTBDef Is Nothing) Then
-        Try
-            oSheet.AddTitleBlock(oTBDef)
-        Catch
+        If Not String.IsNullOrEmpty(sTBName) Then
             Try
-                oSheet.AddTitleBlock(oTBDef.Name)
+                oSheet.AddTitleBlock(sTBName)
             Catch ex As Exception
                 Logger.Warn("Title block could not be added to sheet '" & oSheet.Name & "': " & ex.Message)
             End Try
-        End Try
+        End If
     End If
 
 End Sub
@@ -325,7 +361,10 @@ End Sub
 Function AddViewSafe(oSheet As Sheet, oDoc As Document, oPos As Point2d, dScale As Double, _
         eOrient As ViewOrientationTypeEnum, eStyle As DrawingViewStyleEnum, sTag As String) As DrawingView
     Try
-        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle)
+        ' Named on creation (6th arg) — confirmed working in the baseline run (named views
+        ' like "MAIN ASSEMBLY" showed up correctly in the browser tree). v2 silently dropped
+        ' this arg; restored here since AutoBalloonView now looks the main view up by name.
+        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle, sTag)
     Catch ex As Exception
         Logger.Warn("View '" & sTag & "' failed on sheet '" & oSheet.Name & "': " & ex.Message)
         Return Nothing
@@ -399,19 +438,20 @@ End Sub
 
 ' =====================================================================
 Sub AutoBalloonView(oSheet As Sheet, oView As DrawingView, oAsmDoc As AssemblyDocument)
-' Places one balloon per unique part on the given assembly view, arranged on a
-' ring just outside the view boundary, leader attached to a real model edge.
-' Replaces the old CommandManager placeholder — the macro recorder needed to
-' discover the command name does not exist in this Inventor build, and this
-' DrawingCurves + Balloons.Add route is the documented API path anyway.
-' Balloon numbers come from the drawing BOM, so they match the parts list.
+' Attaches one balloon per unique leaf part to the given view — the "Auto
+' Balloon All Components" behavior — via View.Balloons.AttachToComponent(name),
+' a confirmed-real iLogic snippet for this build (snippet browser: Drawing
+' classic > Balloon Include / Balloon Exclude / Reattach Balloons). Replaces
+' the previous CreateGeometryIntent + ring-math version built from API
+' memory — no longer needed now a bulk per-component call is confirmed to exist.
+'
+' <-- CONFIRM: this assumes ThisDrawing resolves to the drawing document
+'     created in Main() (via Documents.Add(..., True)), even though this
+'     External Rule was launched with the ASSEMBLY as ThisDoc. Whether
+'     ThisDrawing tracks that mid-run switch is unverified — if the lookup
+'     below throws, it falls through to the manual-balloon message instead
+'     of guessing further.
 
-    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
-    Dim done As New HashSet(Of String)
-    Dim ballooned As Integer = 0
-
-    ' Leaf occurrences = actual parts, matching the Parts-Only list.
-    ' Falls back to first-level occurrences if AllLeafOccurrences is unavailable.
     Dim oOccs As Object
     Try
         oOccs = oAsmDoc.ComponentDefinition.Occurrences.AllLeafOccurrences
@@ -420,58 +460,31 @@ Sub AutoBalloonView(oSheet As Sheet, oView As DrawingView, oAsmDoc As AssemblyDo
         Logger.Warn("AllLeafOccurrences unavailable — ballooning first-level occurrences only.")
     End Try
 
-    Dim vc As Point2d = oView.Position
-    Dim ringR As Double = Math.Max(oView.Width, oView.Height) / 2 + 2.0
+    Dim oWView As Object = Nothing
+    Try
+        oWView = ThisDrawing.Sheet(oSheet.Name).View(oView.Name)
+    Catch ex As Exception
+        Logger.Warn("ThisDrawing.Sheet('" & oSheet.Name & "').View('" & oView.Name & "') unavailable: " & _
+            ex.Message & ". Run Annotate > Auto Balloon manually on this sheet, then re-save.")
+        Exit Sub
+    End Try
 
+    Dim ballooned As Integer = 0
+    Dim failed As Integer = 0
     For Each oOcc As ComponentOccurrence In oOccs
         Try
             If oOcc.Suppressed Then Continue For
-            Dim key As String = oOcc.ReferencedDocumentDescriptor.FullDocumentName
-            If done.Contains(key) Then Continue For
-
-            Dim oCurves As DrawingCurvesEnumerator = oView.DrawingCurves(oOcc)
-            If oCurves.Count = 0 Then Continue For   ' part not visible in this view
-
-            ' First curve that yields a usable attach point (closed curves like
-            ' circles have no Mid/StartPoint — fall back to CenterPoint).
-            Dim oCurve As DrawingCurve = Nothing
-            Dim oAttach As Point2d = Nothing
-            For Each c As DrawingCurve In oCurves
-                Dim p As Point2d = c.MidPoint
-                If p Is Nothing Then p = c.StartPoint
-                If p Is Nothing Then p = c.CenterPoint
-                If Not (p Is Nothing) Then
-                    oCurve = c
-                    oAttach = p
-                    Exit For
-                End If
-            Next
-            If oAttach Is Nothing Then Continue For
-
-            ' Balloon sits on a ring outside the view, radially out from the
-            ' view centre through the attach point, clamped onto the sheet.
-            Dim dx As Double = oAttach.X - vc.X
-            Dim dy As Double = oAttach.Y - vc.Y
-            Dim mag As Double = Math.Sqrt(dx * dx + dy * dy)
-            If mag < 0.001 Then
-                dx = 0 : dy = 1 : mag = 1
-            End If
-            Dim bx As Double = Math.Min(Math.Max(vc.X + dx / mag * ringR, 1), oSheet.Width - 1)
-            Dim by As Double = Math.Min(Math.Max(vc.Y + dy / mag * ringR, 1), oSheet.Height - 1)
-
-            Dim oIntent As GeometryIntent = oSheet.CreateGeometryIntent(oCurve, oAttach)
-            Dim oLeader As ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection
-            oLeader.Add(oTG.CreatePoint2d(bx, by))
-            oLeader.Add(oIntent)
-            oSheet.Balloons.Add(oLeader)
-
-            done.Add(key)
+            oWView.Balloons.AttachToComponent(oOcc.Name)
             ballooned = ballooned + 1
         Catch ex As Exception
-            Logger.Warn("Balloon failed for occurrence '" & oOcc.Name & "': " & ex.Message)
+            failed = failed + 1
         End Try
     Next
 
-    Logger.Info(ballooned & " balloon(s) placed on sheet '" & oSheet.Name & "'.")
+    If failed > 0 Then
+        Logger.Warn(failed & " component(s) could not be ballooned on sheet '" & oSheet.Name & _
+            "' (expected for occurrences not visible in this view).")
+    End If
+    Logger.Info(ballooned & " balloon(s) attached on sheet '" & oSheet.Name & "'.")
 
 End Sub
