@@ -77,6 +77,50 @@
 '   * Layout percentages are a rough match to the reference sheet, not an
 '     exact one — same "functional, not beautiful, may need a manual nudge"
 '     caveat already given for balloon placement.
+'
+'  v5 — a real runtime log from the user's Inventor build resolved several
+'  open questions DEFINITIVELY (not just "still unverified"):
+'   * ThisDrawing is confirmed architecturally unusable here, not just
+'     unreliable: the runtime error is literally 'ThisDrawing: This
+'     document "MASTER FILE v1.iam" is not a drawing.' every time. It can
+'     only ever refer to whatever document HOSTS the running rule (the
+'     assembly), never to a drawing created programmatically mid-run.
+'     Removed entirely — border/title block and balloons are back to pure
+'     classic-COM calls.
+'   * AutoBalloonView reverted to the CreateGeometryIntent + Balloons.Add
+'     approach from v2, which the same log actually confirmed working
+'     ("5 balloon(s) placed on sheet 'MAIN ASSEMBLY:1'." with zero
+'     warnings) before v3 replaced it with the now-dead ThisDrawing route.
+'   * ApplySheetFormat: title block has now failed the SAME E_INVALIDARG
+'     three different ways (definition object, name string, name string
+'     via wrapper) — never "member not found", so the call exists but
+'     doesn't like what's been passed so far. Two new attempts added
+'     (document-default parameterless call; a FRESH TitleBlockDefinition
+'     looked up from the document's own collection rather than reusing
+'     sheet 1's applied-instance object/name). If both fail too, the
+'     logged message asks for an IntelliSense check instead of a fourth
+'     blind guess.
+'   * Sheet.BendTables confirmed WRONG — not a parameter issue like the
+'     others, a clean "Public member 'BendTables' on type 'Sheet' not
+'     found." Left Try/Catch-wrapped (still degrades gracefully) but the
+'     log message now asks for an IntelliSense/autocomplete check rather
+'     than implying another guess is coming — no confident second name to try.
+'   * Added a best-effort attempt at "retrieve all model dimensions" on
+'     every view (main assembly, FRONT/TOP/RIGHT/ISO, flat pattern):
+'     NameValueMap key "RetrieveDimensions" = True, mirroring the Base
+'     View dialog's "Retrieve Dimensions" checkbox and the same key/value
+'     pattern as the already-confirmed "SheetMetalFoldedModel". This is a
+'     FRESH, UNCONFIRMED guess — but unlike a wrong enum or member name, an
+'     unrecognized NameValueMap key is typically ignored rather than
+'     erroring, so the downside if the key name is wrong is just "no
+'     dimensions appear", not a broken view. Falls back to the confirmed-
+'     working plain AddBaseView call if this form throws at all.
+'     IMPORTANT even if the key name is exactly right: this can only pull
+'     in dimensions the PART's own author already marked "Include in
+'     Drawing Views" in that part's modeling environment. If the parts
+'     don't have any dimensions flagged for export, nothing will appear
+'     here no matter what this rule does — that's a modeling-side setting,
+'     not something drawing automation can create from scratch.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -170,19 +214,17 @@ Sub Main()
     Dim oMainSheet As Sheet = oDrawDoc.ActiveSheet
     oMainSheet.Name = "MAIN ASSEMBLY"
 
-    ' Remember sheet 1's border/title block + paper size ("Standardrahmen" /
-    ' "Glatt_Norm_eng") so sheets 2..N can reuse them — baseline run left new
-    ' sheets bare. Captured by NAME (string), applied via the ThisDrawing
-    ' wrapper in ApplySheetFormat — see v3 note above.
-    Dim sBorderName As String = ""
+    ' Remember sheet 1's title block name + paper size ("Glatt_Norm_eng") so
+    ' sheets 2..N can reuse them — baseline run left new sheets bare. Border
+    ' needs no name: AddDefaultBorder() in ApplySheetFormat has worked cleanly
+    ' on every run so far, no lookup required.
     Dim sTBName As String = ""
     Dim eMainSize As PaperSizeEnum = kA3PaperSize
     Try
-        If Not (oMainSheet.Border Is Nothing) Then sBorderName = oMainSheet.Border.Name
         If Not (oMainSheet.TitleBlock Is Nothing) Then sTBName = oMainSheet.TitleBlock.Name
         eMainSize = oMainSheet.Size
     Catch ex As Exception
-        Logger.Warn("Could not read border/title block/size from sheet 1: " & ex.Message)
+        Logger.Warn("Could not read title block/size from sheet 1: " & ex.Message)
     End Try
 
     ' Main view: create 1:1, measure, then fit into the area left of the parts list strip
@@ -232,7 +274,7 @@ Sub Main()
     Dim failCount As Integer = 0
     For Each oDoc As Document In uniqueParts.Values
         Try
-            BuildPartSheet(oDrawDoc, oDoc, sBorderName, sTBName, eMainSize, OrthoStyle, IsoStyle, _
+            BuildPartSheet(oDrawDoc, oDoc, sTBName, eMainSize, OrthoStyle, IsoStyle, _
                 MarginL, MarginR, MarginT, MarginB, ViewGap)
         Catch ex As Exception
             failCount = failCount + 1
@@ -252,7 +294,7 @@ End Sub
 
 ' =====================================================================
 Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
-        sBorderName As String, sTBName As String, eSize As PaperSizeEnum, _
+        sTBName As String, eSize As PaperSizeEnum, _
         OrthoStyle As DrawingViewStyleEnum, IsoStyle As DrawingViewStyleEnum, _
         MarginL As Double, MarginR As Double, MarginT As Double, MarginB As Double, _
         ViewGap As Double)
@@ -283,7 +325,7 @@ Sub BuildPartSheet(oDrawDoc As DrawingDocument, oPartDoc As Document, _
         Logger.Warn("Could not set paper size on sheet '" & oSheet.Name & "': " & ex.Message)
     End Try
 
-    ApplySheetFormat(oSheet, sBorderName, sTBName)
+    ApplySheetFormat(oDrawDoc, oSheet, sTBName)
 
     If IsSheetMetal(oPartDoc) Then
         BuildSheetMetalViews(oSheet, oPartDoc, OrthoStyle, IsoStyle, MarginL, MarginR, MarginT, MarginB)
@@ -390,13 +432,22 @@ Sub BuildSheetMetalViews(oSheet As Sheet, oPartDoc As Document, _
         SetPosSafe(oFlatView, MarginL + usableW * 0.32, MarginB + usableH * 0.72)
 
         ' ---- Bend table: below the flat view ----
+        ' <-- CONFIRMED WRONG by a real run: "Public member 'BendTables' on type 'Sheet' not
+        '     found" — a clean member-not-found, not a bad-argument error, so this isn't a case
+        '     of tweaking the call further. Needs ground truth: type "oSheet." in the iLogic
+        '     editor and scan IntelliSense autocomplete for anything containing "Bend" or
+        '     "Table" (also try "oFlatView." in case it hangs off the view/model side instead
+        '     of the sheet). Left in place, Try/Catch-wrapped, so it keeps degrading gracefully
+        '     rather than blocking the flat pattern/ISO views, which already work.
         Try
             Dim oBTPos As Point2d = oTG.CreatePoint2d(MarginL, MarginB + usableH * 0.32)
             oSheet.BendTables.Add(oFlatView, oBTPos)
         Catch ex As Exception
             Logger.Warn("Bend table failed for '" & oPartDoc.DisplayName & "': " & ex.Message & _
-                " — check IntelliSense for the real Sheet.BendTables.Add signature and update " & _
-                "BuildSheetMetalViews(). Continuing without a bend table; flat pattern/ISO still placed.")
+                " — Sheet.BendTables does not exist on this build (confirmed 'member not found', " & _
+                "not a parameter issue). Type ""oSheet."" in the iLogic editor and scan IntelliSense " & _
+                "for the real name/location, then update BuildSheetMetalViews(). Continuing without " & _
+                "a bend table; flat pattern/ISO views are unaffected.")
         End Try
     Else
         Logger.Warn("No flat pattern view for '" & oPartDoc.DisplayName & _
@@ -432,6 +483,7 @@ Function AddFlatPatternViewSafe(oSheet As Sheet, oDoc As Document, oPos As Point
     Try
         oOpts.Add("SheetMetalFoldedModel", False)
         oOpts.Add("DisplayForeshortenedTangentEdges", True)
+        oOpts.Add("RetrieveDimensions", True)   ' <-- fresh, unconfirmed guess — see v5 header note
     Catch ex As Exception
         Logger.Warn("Could not build flat pattern ViewInfo options: " & ex.Message)
     End Try
@@ -473,40 +525,54 @@ End Function
 
 
 ' =====================================================================
-Sub ApplySheetFormat(oSheet As Sheet, sBorderName As String, sTBName As String)
-' Puts sheet 1's border + title block on a freshly added (bare) sheet, by NAME.
-' Primary route: ThisDrawing.Sheet(name).Border = "..." / .TitleBlock = "..." —
-' confirmed-real iLogic snippets shipped with this Inventor build (snippet
-' browser: Drawing (classic) > Change Border / Change Title Block).
-' Falls back to the classic AddDefaultBorder/AddTitleBlock(name) route
-' (confirmed working in createSheets) if the wrapper assignment throws — e.g.
-' if ThisDrawing does not resolve to this new document from an External Rule
-' launched off the assembly. <-- CONFIRM which path fired via Logger output.
+Sub ApplySheetFormat(oDrawDoc As DrawingDocument, oSheet As Sheet, sTBName As String)
+' Puts sheet 1's border + title block on a freshly added (bare) sheet.
+'
+' CONFIRMED from a real run: AddDefaultBorder() succeeds every time — no
+' changes needed there. AddTitleBlock has now failed with the SAME
+' E_INVALIDARG across three different attempts (a TitleBlockDefinition
+' object captured off sheet 1's applied instance; that object's .Name as a
+' plain string; and the same string via the ThisDrawing wrapper) — so the
+' method exists and takes something, just not what's been tried so far.
+' The ThisDrawing wrapper route is gone: confirmed (not just suspected)
+' architecturally unusable here — see AutoBalloonView and the v5 header note.
+'
+' Two more mechanisms tried before asking for IntelliSense:
+'   1. Parameterless AddTitleBlock() — uses the document's own default title
+'      block definition, sidestepping name/object lookup entirely.
+'   2. A FRESH TitleBlockDefinition looked up from the DOCUMENT's own
+'      TitleBlockDefinitions collection by name, rather than reusing the
+'      object/string captured off sheet 1's already-applied instance — those
+'      may not be interchangeable even though they report the same .Name.
+' <-- If both of these also fail: type "oSheet.AddTitleBlock(" in the iLogic
+'     editor and read the IntelliSense tooltip for the real signature —
+'     three guesses failing the same way is a signal to stop guessing.
 
-    Dim usedWrapper As Boolean = False
     Try
-        Dim oWSheet As Object = ThisDrawing.Sheet(oSheet.Name)
-        If Not String.IsNullOrEmpty(sBorderName) Then oWSheet.Border = sBorderName
-        If Not String.IsNullOrEmpty(sTBName) Then oWSheet.TitleBlock = sTBName
-        usedWrapper = True
+        oSheet.AddDefaultBorder()
     Catch ex As Exception
-        Logger.Warn("ThisDrawing.Sheet(...).Border/TitleBlock assignment failed on '" & oSheet.Name & _
-            "': " & ex.Message & " — falling back to classic AddBorder/AddTitleBlock API.")
+        Logger.Warn("No border could be added to sheet '" & oSheet.Name & "': " & ex.Message)
     End Try
 
-    If Not usedWrapper Then
+    Dim tbDone As Boolean = False
+    Try
+        oSheet.AddTitleBlock()
+        tbDone = True
+    Catch ex As Exception
+        Logger.Warn("AddTitleBlock() (document default) failed on '" & oSheet.Name & "': " & ex.Message)
+    End Try
+
+    If Not tbDone AndAlso Not String.IsNullOrEmpty(sTBName) Then
         Try
-            oSheet.AddDefaultBorder()
+            Dim oTBDef As TitleBlockDefinition = oDrawDoc.TitleBlockDefinitions.Item(sTBName)
+            oSheet.AddTitleBlock(oTBDef)
+            tbDone = True
         Catch ex As Exception
-            Logger.Warn("No border could be added to sheet '" & oSheet.Name & "': " & ex.Message)
+            Logger.Warn("AddTitleBlock(TitleBlockDefinitions.Item(""" & sTBName & """)) failed on '" & _
+                oSheet.Name & "': " & ex.Message & ". Title block has now failed 3 different ways — " & _
+                "type ""oSheet.AddTitleBlock("" in the iLogic editor and read the IntelliSense tooltip " & _
+                "for the real signature, then update ApplySheetFormat().")
         End Try
-        If Not String.IsNullOrEmpty(sTBName) Then
-            Try
-                oSheet.AddTitleBlock(sTBName)
-            Catch ex As Exception
-                Logger.Warn("Title block could not be added to sheet '" & oSheet.Name & "': " & ex.Message)
-            End Try
-        End If
     End If
 
 End Sub
@@ -515,14 +581,34 @@ End Sub
 ' =====================================================================
 Function AddViewSafe(oSheet As Sheet, oDoc As Document, oPos As Point2d, dScale As Double, _
         eOrient As ViewOrientationTypeEnum, eStyle As DrawingViewStyleEnum, sTag As String) As DrawingView
+' Named on creation (6th arg) — confirmed working across every run so far (every FRONT/TOP/
+' RIGHT/ISO/MAIN ASSEMBLY view kept its intended name with zero warnings).
+'
+' "RetrieveDimensions" = True on the ViewInfo NameValueMap is a NEW, UNCONFIRMED attempt at
+' pulling model dimensions onto every view — mirrors the Base View dialog's "Retrieve
+' Dimensions" checkbox, same key/value pattern as the already-confirmed "SheetMetalFoldedModel"
+' (see v5 header note). Unlike a wrong enum or member name, an unrecognized NameValueMap key
+' is typically ignored rather than erroring, so this is lower-risk than most guesses here —
+' but it still falls back to the confirmed-working plain call if the 8-arg form throws at all,
+' rather than risk regressing something that already works.
+
+    Dim oOpts As NameValueMap = ThisApplication.TransientObjects.CreateNameValueMap
     Try
-        ' Named on creation (6th arg) — confirmed working in the baseline run (named views
-        ' like "MAIN ASSEMBLY" showed up correctly in the browser tree). v2 silently dropped
-        ' this arg; restored here since AutoBalloonView now looks the main view up by name.
-        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle, sTag)
+        oOpts.Add("RetrieveDimensions", True)
+    Catch
+    End Try
+
+    Try
+        Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle, sTag, , oOpts)
     Catch ex As Exception
-        Logger.Warn("View '" & sTag & "' failed on sheet '" & oSheet.Name & "': " & ex.Message)
-        Return Nothing
+        Logger.Warn("View '" & sTag & "' with RetrieveDimensions failed: " & ex.Message & _
+            " — retrying with the confirmed-working plain form (no dimension retrieval).")
+        Try
+            Return oSheet.DrawingViews.AddBaseView(oDoc, oPos, dScale, eOrient, eStyle, sTag)
+        Catch ex2 As Exception
+            Logger.Warn("View '" & sTag & "' failed entirely on sheet '" & oSheet.Name & "': " & ex2.Message)
+            Return Nothing
+        End Try
     End Try
 End Function
 
@@ -593,20 +679,22 @@ End Sub
 
 ' =====================================================================
 Sub AutoBalloonView(oSheet As Sheet, oView As DrawingView, oAsmDoc As AssemblyDocument)
-' Attaches one balloon per unique leaf part to the given view — the "Auto
-' Balloon All Components" behavior — via View.Balloons.AttachToComponent(name),
-' a confirmed-real iLogic snippet for this build (snippet browser: Drawing
-' classic > Balloon Include / Balloon Exclude / Reattach Balloons). Replaces
-' the previous CreateGeometryIntent + ring-math version built from API
-' memory — no longer needed now a bulk per-component call is confirmed to exist.
-'
-' <-- CONFIRM: this assumes ThisDrawing resolves to the drawing document
-'     created in Main() (via Documents.Add(..., True)), even though this
-'     External Rule was launched with the ASSEMBLY as ThisDoc. Whether
-'     ThisDrawing tracks that mid-run switch is unverified — if the lookup
-'     below throws, it falls through to the manual-balloon message instead
-'     of guessing further.
+' CONFIRMED WORKING by a real run (Logger showed "5 balloon(s) placed on sheet
+' 'MAIN ASSEMBLY:1'." with zero warnings). The View.Balloons.AttachToComponent(name)
+' route tried afterward turned out to be unusable here: ThisDrawing can only ever
+' refer to the document that HOSTS this rule (the assembly), never to a drawing
+' document created programmatically mid-run — confirmed by the literal runtime
+' error 'ThisDrawing: This document "MASTER FILE v1.iam" is not a drawing.' every
+' time. Reverted to this classic-COM approach: one balloon per unique leaf part,
+' leader attached to a real model edge via CreateGeometryIntent, placed on a ring
+' just outside the view boundary.
 
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim done As New HashSet(Of String)
+    Dim ballooned As Integer = 0
+
+    ' Leaf occurrences = actual parts, matching the Parts-Only list.
+    ' Falls back to first-level occurrences if AllLeafOccurrences is unavailable.
     Dim oOccs As Object
     Try
         oOccs = oAsmDoc.ComponentDefinition.Occurrences.AllLeafOccurrences
@@ -615,31 +703,58 @@ Sub AutoBalloonView(oSheet As Sheet, oView As DrawingView, oAsmDoc As AssemblyDo
         Logger.Warn("AllLeafOccurrences unavailable — ballooning first-level occurrences only.")
     End Try
 
-    Dim oWView As Object = Nothing
-    Try
-        oWView = ThisDrawing.Sheet(oSheet.Name).View(oView.Name)
-    Catch ex As Exception
-        Logger.Warn("ThisDrawing.Sheet('" & oSheet.Name & "').View('" & oView.Name & "') unavailable: " & _
-            ex.Message & ". Run Annotate > Auto Balloon manually on this sheet, then re-save.")
-        Exit Sub
-    End Try
+    Dim vc As Point2d = oView.Position
+    Dim ringR As Double = Math.Max(oView.Width, oView.Height) / 2 + 2.0
 
-    Dim ballooned As Integer = 0
-    Dim failed As Integer = 0
     For Each oOcc As ComponentOccurrence In oOccs
         Try
             If oOcc.Suppressed Then Continue For
-            oWView.Balloons.AttachToComponent(oOcc.Name)
+            Dim key As String = oOcc.ReferencedDocumentDescriptor.FullDocumentName
+            If done.Contains(key) Then Continue For
+
+            Dim oCurves As DrawingCurvesEnumerator = oView.DrawingCurves(oOcc)
+            If oCurves.Count = 0 Then Continue For   ' part not visible in this view
+
+            ' First curve that yields a usable attach point (closed curves like
+            ' circles have no Mid/StartPoint — fall back to CenterPoint).
+            Dim oCurve As DrawingCurve = Nothing
+            Dim oAttach As Point2d = Nothing
+            For Each c As DrawingCurve In oCurves
+                Dim p As Point2d = c.MidPoint
+                If p Is Nothing Then p = c.StartPoint
+                If p Is Nothing Then p = c.CenterPoint
+                If Not (p Is Nothing) Then
+                    oCurve = c
+                    oAttach = p
+                    Exit For
+                End If
+            Next
+            If oAttach Is Nothing Then Continue For
+
+            ' Balloon sits on a ring outside the view, radially out from the
+            ' view centre through the attach point, clamped onto the sheet.
+            Dim dx As Double = oAttach.X - vc.X
+            Dim dy As Double = oAttach.Y - vc.Y
+            Dim mag As Double = Math.Sqrt(dx * dx + dy * dy)
+            If mag < 0.001 Then
+                dx = 0 : dy = 1 : mag = 1
+            End If
+            Dim bx As Double = Math.Min(Math.Max(vc.X + dx / mag * ringR, 1), oSheet.Width - 1)
+            Dim by As Double = Math.Min(Math.Max(vc.Y + dy / mag * ringR, 1), oSheet.Height - 1)
+
+            Dim oIntent As GeometryIntent = oSheet.CreateGeometryIntent(oCurve, oAttach)
+            Dim oLeader As ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection
+            oLeader.Add(oTG.CreatePoint2d(bx, by))
+            oLeader.Add(oIntent)
+            oSheet.Balloons.Add(oLeader)
+
+            done.Add(key)
             ballooned = ballooned + 1
         Catch ex As Exception
-            failed = failed + 1
+            Logger.Warn("Balloon failed for occurrence '" & oOcc.Name & "': " & ex.Message)
         End Try
     Next
 
-    If failed > 0 Then
-        Logger.Warn(failed & " component(s) could not be ballooned on sheet '" & oSheet.Name & _
-            "' (expected for occurrences not visible in this view).")
-    End If
-    Logger.Info(ballooned & " balloon(s) attached on sheet '" & oSheet.Name & "'.")
+    Logger.Info(ballooned & " balloon(s) placed on sheet '" & oSheet.Name & "'.")
 
 End Sub
