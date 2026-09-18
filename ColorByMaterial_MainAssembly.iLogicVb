@@ -1,0 +1,667 @@
+' =====================================================================
+'  COLOR BY MATERIAL — Main Assembly  (rule name: ColorByMaterial)
+'  Purpose: color every part occurrence in the active assembly by its
+'    assigned Material iProperty, and produce a PERSISTENT count of parts
+'    per material + color, in two forms that survive after this rule
+'    finishes (unlike a MessageBox, which disappears once dismissed, or the
+'    iLogic Log window, which clears/scrolls away):
+'      1. A custom iProperty on the assembly ("ColorByMaterial Summary"),
+'         readable any time via File > iProperties > Custom — no drawing
+'         needed. NOTE: like any iProperty edit, it only survives to disk
+'         once you save the assembly — this rule does NOT auto-save it for
+'         you (auto-saving the document you have open is a bigger side
+'         effect than a coloring/reporting rule should take without asking).
+'      2. A CSV file written next to the assembly
+'         ("<assembly name>_ColorByMaterial.csv") — Material, Appearance,
+'         PartCount columns, openable in Excel, independent of Inventor.
+'
+'  Run with the main .iam as the ACTIVE document.
+'  Structured as External Rule (Sub Main + helpers), matching
+'  DrawingAutomation_MainAssembly.iLogicVb in this repo.
+'
+'  v1 — first draft, colored materials via a hand-written Material name ->
+'  Appearance name lookup table.
+'
+'  v2 — added a Revert path (Appearance = Nothing on every leaf occurrence)
+'  and speed changes for large assemblies: per-document material caching,
+'  per-appearance-name asset caching, ScreenUpdating suspended for the loop.
+'
+'  v3 — a real run against this shop's actual assembly (208 occurrences, 25
+'  distinct materials) showed 0 failures but every single material fell
+'  back to the same "Default" gray: the v1 lookup table's placeholder
+'  English names (e.g. "Steel, Mild") never matched this shop's real
+'  material vocabulary (e.g. "1.4301", "AISI 316 L", "HASTEALLOY C-276" vs
+'  "Hastelloy C-276" — a genuine misspelling, not just a casing difference).
+'  Per explicit direction: a lookup table of ANY kind — exact-match or
+'  keyword-based — was rejected, since it will always play catch-up with
+'  however a given shop's material library happens to be spelled. Replaced
+'  entirely with: read each occurrence's Material, and the first time a
+'  given value is seen, synthesize a brand-new color for it and remember it
+'  by name; every later occurrence of that same material reuses it. No
+'  table, so no spelling/casing/language dependency at all — materials are
+'  only ever compared to each other for exact identity, never matched
+'  against a pre-written list of expected names.
+'   * Color synthesis (GetOrCreateMaterialAsset, HSVtoRGB) and the speed
+'     techniques below (TransactionManager batching, a single
+'     InventorVb.DocumentUpdate() instead of implicit per-change updates,
+'     Stopwatch timing) are ADAPTED FROM A SEPARATELY-VALIDATED "color by
+'     unique part" iLogic rule the user supplied from prior work — that
+'     rule's own inline comment records a real debugged fix on the
+'     Assets.Add(...) call, so this is grounded in code that has actually
+'     run successfully, not another guess. Confirms the "generic_diffuse"
+'     field name I would otherwise have had to guess at.
+'   * Adapted, not copied verbatim: keyed by MATERIAL NAME instead of by
+'     unique part Document, and each synthesized asset is named
+'     deterministically from the material ("ColorByMaterial_<sanitized
+'     material>") rather than a positional index — so re-running this rule
+'     later reuses the SAME color for the SAME material (checked by name
+'     against the document's existing Assets) instead of reshuffling colors
+'     every run, and the Appearance browser shows a readable name per
+'     material instead of an opaque index.
+'   * Transaction batching is made SELF-DISABLING here (the reference didn't
+'     need this, presumably because it was already confirmed working in its
+'     own context): if TransactionManager.StartTransaction throws at all —
+'     plausible if iLogic already wraps rule execution in its own implicit
+'     transaction, which I have not verified either way — the rule logs it
+'     once and continues without batching rather than crashing outright.
+'   * A small named-color palette (~15 entries, resolved via the existing
+'     GetAppearance helper) stays as an explicit fallback net if
+'     Assets.Add(...) or the generic_diffuse write fails, either globally
+'     (the "Generic" template itself unavailable — logged once) or for one
+'     specific material (logged once, for that material only) — so a
+'     surprise on this Inventor build degrades to "some materials share a
+'     palette color" rather than regressing to this run's "everything the
+'     same gray".
+'   * STILL UNVERIFIED ON THIS EXACT BUILD, same honesty level as v1/v2:
+'     "adapted from code that worked elsewhere" is materially better odds
+'     than "written from API documentation alone", but it is not the same
+'     as "tested in this file, in this context". Run it and report back
+'     what Logger shows.
+' =====================================================================
+
+Imports System.Collections.Generic
+
+Sub Main()
+
+    ' ---------------- CONSTANTS — EDIT THESE ----------------
+    Dim ChunkSize As Integer = 200   ' occurrences per batched Inventor transaction — speed technique, see header
+
+    ' Fallback-only palette (no material name is ever matched against this list —
+    ' it's just a source of distinct colors if runtime color synthesis fails for a
+    ' given material). Resolved by name via GetAppearance, same as v1/v2.
+    Dim ColorPalette As New List(Of String)
+    ColorPalette.Add("Red")
+    ColorPalette.Add("Green")
+    ColorPalette.Add("Blue")
+    ColorPalette.Add("Yellow")
+    ColorPalette.Add("Orange")
+    ColorPalette.Add("Purple")
+    ColorPalette.Add("Cyan")
+    ColorPalette.Add("Magenta")
+    ColorPalette.Add("Pink")
+    ColorPalette.Add("Brown")
+    ColorPalette.Add("Black")
+    ColorPalette.Add("White")
+    ColorPalette.Add("Gray (Light)")
+    ColorPalette.Add("Gray (Medium)")
+    ColorPalette.Add("Gray (Dark)")
+
+    ' ---------------- VALIDATE ACTIVE DOC ----------------
+    If ThisDoc.Document.DocumentType <> kAssemblyDocumentObject Then
+        MessageBox.Show("Open the main assembly (.iam) and re-run.", "Wrong document type")
+        Exit Sub
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = ThisDoc.Document
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+    ' ---------------- CHOOSE ACTION ----------------
+    Dim actionOptions As New List(Of String)
+    actionOptions.Add("Apply Colors By Material")
+    actionOptions.Add("Revert To Original Appearance")
+    Dim sAction As String = InputListBox("Color By Material — choose an action:", actionOptions, _
+        actionOptions(0), "Color By Material", "Action")
+
+    If String.IsNullOrEmpty(sAction) Then
+        Logger.Info("Color By Material canceled by user (no action chosen).")
+        Exit Sub
+    End If
+
+    If sAction = "Revert To Original Appearance" Then
+        RevertAppearances(oCompDef)
+        Exit Sub
+    End If
+
+    ' ---------------- WALK LEAF OCCURRENCES ----------------
+    ' Occurrences (not unique part documents) are counted, so a part used 3x
+    ' in this assembly contributes 3 to its material's count — matches how a
+    ' parts list QTY column would read, and each occurrence needs its own
+    ' Appearance override applied regardless of whether other occurrences
+    ' share the same underlying document.
+    Dim oOccs As Object
+    Try
+        oOccs = oCompDef.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oCompDef.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — only top-level occurrences will be colored/counted; parts nested inside subassemblies will be skipped.")
+    End Try
+
+    Dim counts As New Dictionary(Of String, Integer)(StringComparer.OrdinalIgnoreCase)
+    Dim appearanceUsed As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    Dim materialAssetMap As New Dictionary(Of String, Asset)(StringComparer.OrdinalIgnoreCase)
+    Dim coloredCount As Integer = 0
+    Dim failCount As Integer = 0
+    Dim failureExamples As New List(Of String)   ' capped at 5, see below
+
+    ' SPEED: avoids re-reading (and, on the fallback path, re-throwing through Try/Catch)
+    ' the same part's Material property once per OCCURRENCE — a part instanced 40x was
+    ' doing that read 40 times for no reason.
+    Dim materialCache As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+    ' Pre-scan existing Asset names so re-running this rule REUSES a material's color
+    ' from a previous run (by name) instead of creating a duplicate, and so new colors
+    ' this run don't reuse a hue already spent on an existing "ColorByMaterial_*" asset.
+    Dim existingNames As New HashSet(Of String)
+    Try
+        For Each a As Asset In oAsmDoc.Assets
+            Try
+                existingNames.Add(a.Name)
+            Catch
+            End Try
+        Next
+    Catch ex As Exception
+        Logger.Warn("Could not pre-scan existing Assets: " & ex.Message)
+    End Try
+    Dim colorIndex As Integer = 0
+    For Each n As String In existingNames
+        If n.StartsWith("ColorByMaterial_") Then colorIndex = colorIndex + 1
+    Next
+
+    Dim swTotal As New System.Diagnostics.Stopwatch
+    swTotal.Start()
+
+    ' SPEED: suspend redraws for the duration of the loop — otherwise every single
+    ' Appearance assignment can trigger a viewport refresh. Restored via Finally so it
+    ' comes back even if something below throws.
+    Dim wasUpdating As Boolean = True
+    Try
+        wasUpdating = ThisApplication.ScreenUpdating
+        ThisApplication.ScreenUpdating = False
+    Catch
+    End Try
+
+    ' SPEED: batch occurrence writes into transactions committed every ChunkSize
+    ' occurrences instead of one transaction per write. Self-disabling (see header) —
+    ' if StartTransaction itself throws, useTransactions flips off and the loop below
+    ' just runs without batching rather than crashing the whole rule.
+    Dim tm As TransactionManager = Nothing
+    Dim trans As Transaction = Nothing
+    Dim useTransactions As Boolean = True
+    Dim inChunk As Integer = 0
+    Try
+        tm = ThisApplication.TransactionManager
+        trans = tm.StartTransaction(oAsmDoc, "ColorByMaterial")
+    Catch ex As Exception
+        useTransactions = False
+        Logger.Warn("Could not start a batched transaction — continuing without it (may be slower): " & ex.Message)
+    End Try
+
+    Try
+        For Each oOcc As ComponentOccurrence In oOccs
+            Try
+                If oOcc.Suppressed Then Continue For
+
+                Dim oPartDoc As Document = Nothing
+                Try
+                    oPartDoc = oOcc.Definition.Document
+                Catch
+                    Continue For   ' virtual component or similar with no backing document
+                End Try
+                If oPartDoc Is Nothing OrElse oPartDoc.DocumentType <> kPartDocumentObject Then Continue For
+
+                Dim sDocKey As String = oPartDoc.FullFileName
+                Dim sMaterial As String = ""
+                If materialCache.ContainsKey(sDocKey) Then
+                    sMaterial = materialCache(sDocKey)
+                Else
+                    sMaterial = GetMaterialName(oPartDoc)
+                    materialCache(sDocKey) = sMaterial
+                End If
+                If String.IsNullOrEmpty(sMaterial) Then sMaterial = "(no material assigned)"
+
+                Dim oAsset As Asset = Nothing
+                If materialAssetMap.ContainsKey(sMaterial) Then
+                    oAsset = materialAssetMap(sMaterial)
+                Else
+                    counts(sMaterial) = 0
+                    Dim sDesc As String = ""
+                    oAsset = GetOrCreateMaterialAsset(oAsmDoc, sMaterial, existingNames, colorIndex, ColorPalette, sDesc)
+                    appearanceUsed(sMaterial) = sDesc
+                    materialAssetMap(sMaterial) = oAsset
+                End If
+
+                If oAsset Is Nothing Then
+                    failCount = failCount + 1
+                    If failureExamples.Count < 5 Then failureExamples.Add(oOcc.Name & " (material '" & sMaterial & "', no asset resolved)")
+                Else
+                    Try
+                        oOcc.Appearance = oAsset
+                        coloredCount = coloredCount + 1
+                    Catch ex As Exception
+                        failCount = failCount + 1
+                        If failureExamples.Count < 5 Then failureExamples.Add(oOcc.Name & ": " & ex.Message)
+                    End Try
+                End If
+
+                counts(sMaterial) = counts(sMaterial) + 1
+
+                If useTransactions Then
+                    inChunk = inChunk + 1
+                    If inChunk >= ChunkSize Then
+                        Try
+                            trans.End()
+                            trans = tm.StartTransaction(oAsmDoc, "ColorByMaterial")
+                        Catch ex As Exception
+                            useTransactions = False
+                            Logger.Warn("Transaction batching failed mid-run — continuing without it: " & ex.Message)
+                        End Try
+                        inChunk = 0
+                    End If
+                End If
+
+            Catch ex As Exception
+                failCount = failCount + 1
+                Logger.Warn("Occurrence failed: " & ex.Message)
+            End Try
+        Next
+
+        If useTransactions Then
+            Try
+                trans.End()
+            Catch
+            End Try
+        End If
+
+    Catch exOuter As Exception
+        Logger.Warn("Coloring pass aborted partway through: " & exOuter.Message)
+        If useTransactions Then
+            Try
+                trans.End()
+            Catch
+                Try
+                    trans.Abort()
+                Catch
+                End Try
+            End Try
+        End If
+    Finally
+        Try
+            ThisApplication.ScreenUpdating = wasUpdating
+        Catch
+        End Try
+    End Try
+
+    Try
+        InventorVb.DocumentUpdate()
+    Catch
+    End Try
+    swTotal.Stop()
+    Dim elapsedSeconds As Double = swTotal.ElapsedMilliseconds / 1000.0
+
+    Logger.Info(coloredCount & " occurrence(s) colored, " & failCount & " failed/skipped. Elapsed " & _
+        elapsedSeconds.ToString("0.0") & "s.")
+    If failureExamples.Count > 0 Then
+        Dim sExtra As String = ""
+        If failCount > failureExamples.Count Then sExtra = " (+" & (failCount - failureExamples.Count) & " more)"
+        Logger.Warn("First failing occurrence(s): " & String.Join("; ", failureExamples) & sExtra)
+    End If
+
+    ' ---------------- PERSISTENT OUTPUT ----------------
+    Dim sReport As String = BuildReport(counts, appearanceUsed, elapsedSeconds)
+
+    WriteSummaryIProperty(oAsmDoc, sReport)
+
+    Dim sCsvPath As String = ThisDoc.Path & "\" & ThisDoc.FileName(False) & "_ColorByMaterial.csv"
+    WriteCsvReport(sCsvPath, counts, appearanceUsed)
+
+    MessageBox.Show(sReport, "Color By Material — Summary")
+
+End Sub
+
+
+' =====================================================================
+Function GetOrCreateMaterialAsset(oDoc As Document, sMaterial As String, _
+        existingNames As HashSet(Of String), ByRef colorIndex As Integer, _
+        ColorPalette As List(Of String), ByRef sDescription As String) As Asset
+' First time a material is seen: reuse a same-named asset left over from a previous run
+' of this rule (same material keeps the same color across runs), otherwise synthesize a
+' brand-new one from Inventor's "Generic" appearance template and recolor it directly.
+' Assets.Add(kAssetTypeAppearance, "Generic", Type.Missing, name) and
+' asset.Item("generic_diffuse") are both ADAPTED FROM A SEPARATELY-VALIDATED "color by
+' unique part" iLogic rule (see file header) rather than guessed from documentation —
+' the reference's own comment records a real debugged fix on this exact Assets.Add call.
+' Falls back to a small named-color palette (via GetAppearance, unchanged from v1/v2) if
+' either step throws — a template/field-name surprise on this build degrades to "this
+' one material shares a palette color" rather than every material landing on one gray.
+
+    Dim sAssetName As String = "ColorByMaterial_" & SanitizeForAssetName(sMaterial)
+
+    If existingNames.Contains(sAssetName) Then
+        Try
+            Dim oExisting As Asset = oDoc.Assets.Item(sAssetName)
+            sDescription = "(reused from a previous run: " & sAssetName & ")"
+            Return oExisting
+        Catch
+            ' name was in the pre-scanned set but couldn't actually be fetched — fall through and (re)create it
+        End Try
+    End If
+
+    Try
+        ' Golden-ratio hue stepping: (index * 0.618033988749895) Mod 1.0 gives a
+        ' well-spread, low-repetition sequence of hues for any number of materials,
+        ' with no fixed palette size to exhaust. Adapted verbatim from the reference rule.
+        Dim hueFrac As Double = (colorIndex * 0.618033988749895) Mod 1.0
+        Dim rB As Byte, gB As Byte, bB As Byte
+        HSVtoRGB(hueFrac, 0.7, 0.95, rB, gB, bB)
+
+        Dim oNewAsset As Asset = oDoc.Assets.Add(AssetTypeEnum.kAssetTypeAppearance, "Generic", Type.Missing, sAssetName)
+        Dim cv As ColorAssetValue = oNewAsset.Item("generic_diffuse")
+        cv.Value = ThisApplication.TransientObjects.CreateColor(rB, gB, bB)
+
+        existingNames.Add(oNewAsset.Name)
+        colorIndex = colorIndex + 1
+        sDescription = "RGB(" & rB & "," & gB & "," & bB & ")"
+        Return oNewAsset
+    Catch ex As Exception
+        Logger.Warn("Could not synthesize a color asset for material '" & sMaterial & "': " & ex.Message & _
+            " — using a palette color instead.")
+    End Try
+
+    Dim sColorName As String = ColorPalette(colorIndex Mod ColorPalette.Count)
+    colorIndex = colorIndex + 1
+    Dim oFallback As Asset = GetAppearance(oDoc, sColorName)
+    sDescription = sColorName & " (fallback)"
+    If oFallback Is Nothing Then
+        Logger.Warn("Palette fallback color '" & sColorName & "' also not found for material '" & sMaterial & "' — left uncolored.")
+    End If
+    Return oFallback
+
+End Function
+
+
+' =====================================================================
+Sub HSVtoRGB(h As Double, s As Double, v As Double, _
+             ByRef r As Byte, ByRef g As Byte, ByRef b As Byte)
+' Standard HSV->RGB conversion. h is a fraction in [0,1), s and v in [0,1].
+' Pure arithmetic, no Inventor API involved — zero risk, verbatim from the
+' reference rule (see file header).
+    Dim i As Integer = CInt(Math.Floor(h * 6))
+    Dim f As Double = h * 6 - i
+    Dim p As Double = v * (1 - s)
+    Dim q As Double = v * (1 - f * s)
+    Dim t As Double = v * (1 - (1 - f) * s)
+    Dim rd As Double, gd As Double, bd As Double
+    Select Case i Mod 6
+        Case 0 : rd = v : gd = t : bd = p
+        Case 1 : rd = q : gd = v : bd = p
+        Case 2 : rd = p : gd = v : bd = t
+        Case 3 : rd = p : gd = q : bd = v
+        Case 4 : rd = t : gd = p : bd = v
+        Case 5 : rd = v : gd = p : bd = q
+    End Select
+    r = CByte(rd * 255) : g = CByte(gd * 255) : b = CByte(bd * 255)
+End Sub
+
+
+' =====================================================================
+Function SanitizeForAssetName(s As String) As String
+' Inventor Asset names are generally permissive, but material strings in this shop's
+' library include characters ("/", "°") that are safer not to trust literally in a
+' name string. Replaces anything that isn't a letter or digit with "_".
+    Dim sb As New System.Text.StringBuilder
+    For Each ch As Char In s
+        If Char.IsLetterOrDigit(ch) Then
+            sb.Append(ch)
+        Else
+            sb.Append("_")
+        End If
+    Next
+    Return sb.ToString()
+End Function
+
+
+' =====================================================================
+Sub RevertAppearances(oCompDef As AssemblyComponentDefinition)
+' Clears the occurrence-level override on every leaf occurrence — setting
+' Appearance = Nothing is the documented way to drop an override and fall
+' back to whatever appearance the part itself defines. Does not touch any
+' CSV file or custom iProperty a previous "Apply" run wrote (history stays),
+' and does not delete the "ColorByMaterial_*" assets those runs created
+' (harmless clutter in the document's Asset list; left alone deliberately
+' to keep Revert simple and low-risk).
+    Dim oOccs As Object
+    Try
+        oOccs = oCompDef.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oCompDef.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — only top-level occurrences will be reverted.")
+    End Try
+
+    Dim swTotal As New System.Diagnostics.Stopwatch
+    swTotal.Start()
+
+    Dim wasUpdating As Boolean = True
+    Try
+        wasUpdating = ThisApplication.ScreenUpdating
+        ThisApplication.ScreenUpdating = False
+    Catch
+    End Try
+
+    Dim tm As TransactionManager = Nothing
+    Dim trans As Transaction = Nothing
+    Dim useTransactions As Boolean = True
+    Dim inChunk As Integer = 0
+    Dim ChunkSize As Integer = 200
+    Try
+        tm = ThisApplication.TransactionManager
+        trans = tm.StartTransaction(oCompDef.Document, "ColorByMaterial Revert")
+    Catch ex As Exception
+        useTransactions = False
+        Logger.Warn("Could not start a batched transaction — continuing without it (may be slower): " & ex.Message)
+    End Try
+
+    Dim revertedCount As Integer = 0
+    Dim failCount As Integer = 0
+    Try
+        For Each oOcc As ComponentOccurrence In oOccs
+            Try
+                If oOcc.Suppressed Then Continue For
+                oOcc.Appearance = Nothing
+                revertedCount = revertedCount + 1
+
+                If useTransactions Then
+                    inChunk = inChunk + 1
+                    If inChunk >= ChunkSize Then
+                        Try
+                            trans.End()
+                            trans = tm.StartTransaction(oCompDef.Document, "ColorByMaterial Revert")
+                        Catch ex As Exception
+                            useTransactions = False
+                            Logger.Warn("Transaction batching failed mid-run — continuing without it: " & ex.Message)
+                        End Try
+                        inChunk = 0
+                    End If
+                End If
+            Catch ex As Exception
+                failCount = failCount + 1
+                Logger.Warn("Could not revert appearance on '" & oOcc.Name & "': " & ex.Message)
+            End Try
+        Next
+
+        If useTransactions Then
+            Try
+                trans.End()
+            Catch
+            End Try
+        End If
+
+    Catch exOuter As Exception
+        Logger.Warn("Revert pass aborted partway through: " & exOuter.Message)
+        If useTransactions Then
+            Try
+                trans.End()
+            Catch
+                Try
+                    trans.Abort()
+                Catch
+                End Try
+            End Try
+        End If
+    Finally
+        Try
+            ThisApplication.ScreenUpdating = wasUpdating
+        Catch
+        End Try
+    End Try
+
+    Try
+        InventorVb.DocumentUpdate()
+    Catch
+    End Try
+    swTotal.Stop()
+
+    Logger.Info(revertedCount & " occurrence(s) reverted to their original appearance, " & failCount & _
+        " failed. Elapsed " & (swTotal.ElapsedMilliseconds / 1000.0).ToString("0.0") & "s.")
+    MessageBox.Show(revertedCount & " part(s) reverted to their original appearance." & vbCrLf & _
+        failCount & " failed (see Logger).", "Color By Material — Revert")
+End Sub
+
+
+' =====================================================================
+Function GetMaterialName(oDoc As Document) As String
+' Primary path: PartComponentDefinition.Material.Name (Inventor 2018+ physical
+' material object). Falls back to the classic "Material" iProperty in the
+' Design Tracking Properties set for older builds / if that member is missing
+' — same layered-fallback pattern used throughout DrawingAutomation_MainAssembly.
+    Try
+        Return oDoc.ComponentDefinition.Material.Name
+    Catch
+    End Try
+    Try
+        Return oDoc.PropertySets.Item("Design Tracking Properties").Item("Material").Value.ToString()
+    Catch
+    End Try
+    Return ""
+End Function
+
+
+' =====================================================================
+Function GetAppearance(oDoc As Document, sName As String) As Asset
+' Looks for the named appearance already local to this document first (cheap,
+' no copy needed). If not present, scans every loaded Asset Library and copies
+' the first match into this document — the standard way to pull in an
+' appearance that exists in a library but hasn't been used in this file yet.
+' Only used now as the fallback-palette resolver (see GetOrCreateMaterialAsset).
+    Try
+        Return oDoc.Assets.Item(sName)
+    Catch
+    End Try
+
+    Try
+        For Each oLib As AssetLibrary In ThisApplication.AssetLibraries
+            Try
+                Dim oLibAsset As Asset = oLib.AppearanceAssets.Item(sName)
+                Return oLibAsset.CopyTo(oDoc, True)
+            Catch
+                ' not in this library — try the next one
+            End Try
+        Next
+    Catch ex As Exception
+        Logger.Warn("Could not enumerate Asset Libraries while looking up '" & sName & "': " & ex.Message)
+    End Try
+
+    Return Nothing
+End Function
+
+
+' =====================================================================
+Function BuildReport(counts As Dictionary(Of String, Integer), appearanceUsed As Dictionary(Of String, String), _
+        elapsedSeconds As Double) As String
+    Dim keys As New List(Of String)(counts.Keys)
+    keys.Sort()
+
+    Dim sb As New System.Text.StringBuilder
+    sb.AppendLine("Color By Material — part count (" & Now.ToString("yyyy-MM-dd HH:mm") & _
+        ", " & elapsedSeconds.ToString("0.0") & "s)")
+    sb.AppendLine("")
+
+    Dim total As Integer = 0
+    For Each k As String In keys
+        sb.AppendLine(k & "  —  " & appearanceUsed(k) & "  —  " & counts(k) & " part(s)")
+        total = total + counts(k)
+    Next
+
+    sb.AppendLine("")
+    sb.AppendLine("Total: " & total & " part(s) across " & keys.Count & " material(s)")
+
+    Return sb.ToString()
+End Function
+
+
+' =====================================================================
+Sub WriteSummaryIProperty(oDoc As Document, sText As String)
+' Writes the report into a custom iProperty so it stays readable (File >
+' iProperties > Custom tab) without needing this rule's log or a drawing.
+' Does NOT save the document — an iLogic rule silently saving the assembly
+' you have open is a bigger side effect than a color/reporting rule should
+' take on its own. Save manually once you're happy with the result, or the
+' iProperty content stays unsaved-in-memory like any other rule-driven edit.
+    Try
+        Dim oPropSet As PropertySet = oDoc.PropertySets.Item("Inventor User Defined Properties")
+
+        Try
+            oPropSet.Item("ColorByMaterial Summary").Value = sText
+        Catch
+            oPropSet.Add(sText, "ColorByMaterial Summary")
+        End Try
+
+        Try
+            oPropSet.Item("ColorByMaterial Last Run").Value = Now.ToString("yyyy-MM-dd HH:mm")
+        Catch
+            oPropSet.Add(Now.ToString("yyyy-MM-dd HH:mm"), "ColorByMaterial Last Run")
+        End Try
+
+        Logger.Info("Summary written to custom iProperty 'ColorByMaterial Summary' (save the assembly to persist it to disk).")
+    Catch ex As Exception
+        Logger.Warn("Could not write custom iProperty summary: " & ex.Message)
+    End Try
+End Sub
+
+
+' =====================================================================
+Sub WriteCsvReport(sPath As String, counts As Dictionary(Of String, Integer), appearanceUsed As Dictionary(Of String, String))
+    Try
+        Dim keys As New List(Of String)(counts.Keys)
+        keys.Sort()
+
+        Dim sb As New System.Text.StringBuilder
+        sb.AppendLine("Material,Appearance,PartCount")
+        For Each k As String In keys
+            sb.AppendLine(CsvEscape(k) & "," & CsvEscape(appearanceUsed(k)) & "," & counts(k))
+        Next
+
+        System.IO.File.WriteAllText(sPath, sb.ToString())
+        Logger.Info("CSV report written: " & sPath)
+    Catch ex As Exception
+        Logger.Warn("Could not write CSV report to '" & sPath & "': " & ex.Message)
+    End Try
+End Sub
+
+
+' =====================================================================
+Function CsvEscape(s As String) As String
+    If s.Contains(",") Or s.Contains("""") Then
+        Return """" & s.Replace("""", """""") & """"
+    End If
+    Return s
+End Function
