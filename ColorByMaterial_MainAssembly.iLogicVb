@@ -51,6 +51,29 @@
 '  use of a material consistently everywhere would instead mean setting
 '  Appearance on each PART's ComponentDefinition — bigger blast radius
 '  (touches every part file) — not implemented here.
+'
+'  v2 — added a Revert path, and three speed changes for large assemblies:
+'   * The rule now opens with an InputListBox: "Apply Colors By Material" or
+'     "Revert To Original Appearance". Revert clears the occurrence-level
+'     override (Appearance = Nothing, the documented way to drop back to the
+'     part's own appearance) on every leaf occurrence and stops — it does not
+'     touch the CSV/iProperty records of past runs, which stay as history.
+'   * Material lookups are now cached per part FullFileName instead of
+'     re-reading (and re-throwing through Try/Catch on the fallback path) the
+'     same part's Material property once per OCCURRENCE. An assembly with,
+'     say, 40 instances of the same bolt was doing that read 40 times for no
+'     reason — now once.
+'   * Resolved Appearance assets are cached per appearance name instead of
+'     re-running GetAppearance's Asset Library scan for every occurrence that
+'     maps to the same material — the scan is the most expensive part of the
+'     original loop, and most assemblies only have a handful of distinct
+'     appearances no matter how many parts they have.
+'   * ThisApplication.ScreenUpdating is suspended for the duration of the
+'     coloring loop (restored via Try/Finally so it comes back even if
+'     something throws) — a standard Inventor/iLogic trick to stop a redraw
+'     firing on every single Appearance assignment.
+'   None of this changes v1's behavior for a small assembly; it matters once
+'   there are many occurrences or many repeated parts.
 ' =====================================================================
 
 Imports System.Collections.Generic
@@ -86,6 +109,23 @@ Sub Main()
     Dim oAsmDoc As AssemblyDocument = ThisDoc.Document
     Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
 
+    ' ---------------- CHOOSE ACTION ----------------
+    Dim actionOptions As New List(Of String)
+    actionOptions.Add("Apply Colors By Material")
+    actionOptions.Add("Revert To Original Appearance")
+    Dim sAction As String = InputListBox("Color By Material — choose an action:", actionOptions, _
+        actionOptions(0), "Color By Material", "Action")
+
+    If String.IsNullOrEmpty(sAction) Then
+        Logger.Info("Color By Material canceled by user (no action chosen).")
+        Exit Sub
+    End If
+
+    If sAction = "Revert To Original Appearance" Then
+        RevertAppearances(oCompDef)
+        Exit Sub
+    End If
+
     ' ---------------- WALK LEAF OCCURRENCES ----------------
     ' Occurrences (not unique part documents) are counted, so a part used 3x
     ' in this assembly contributes 3 to its material's count — matches how a
@@ -106,53 +146,92 @@ Sub Main()
     Dim coloredCount As Integer = 0
     Dim failCount As Integer = 0
 
-    For Each oOcc As ComponentOccurrence In oOccs
-        Try
-            If oOcc.Suppressed Then Continue For
+    ' SPEED: both caches below exist because the cost in a large assembly is not the
+    ' occurrence loop itself, it's repeating the same Material read or the same Asset
+    ' Library scan once per OCCURRENCE when most assemblies only have a handful of
+    ' distinct parts/appearances. Keyed by FullFileName / appearance name, so a part or
+    ' appearance used 100x is only resolved once.
+    Dim materialCache As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    Dim assetCache As New Dictionary(Of String, Asset)(StringComparer.OrdinalIgnoreCase)
 
-            Dim oPartDoc As Document = Nothing
+    ' SPEED: suspend redraws for the duration of the loop — otherwise every single
+    ' Appearance assignment can trigger a viewport refresh. Restored via Try/Finally
+    ' so it comes back even if something below throws.
+    Dim wasUpdating As Boolean = True
+    Try
+        wasUpdating = ThisApplication.ScreenUpdating
+        ThisApplication.ScreenUpdating = False
+    Catch
+    End Try
+
+    Try
+        For Each oOcc As ComponentOccurrence In oOccs
             Try
-                oPartDoc = oOcc.Definition.Document
-            Catch
-                Continue For   ' virtual component or similar with no backing document
-            End Try
-            If oPartDoc Is Nothing OrElse oPartDoc.DocumentType <> kPartDocumentObject Then Continue For
+                If oOcc.Suppressed Then Continue For
 
-            Dim sMaterial As String = GetMaterialName(oPartDoc)
-            If String.IsNullOrEmpty(sMaterial) Then sMaterial = "(no material assigned)"
-
-            Dim sAppearanceName As String = FallbackAppearanceName
-            If MaterialAppearanceMap.ContainsKey(sMaterial) Then
-                sAppearanceName = MaterialAppearanceMap(sMaterial)
-            Else
-                unmapped.Add(sMaterial)
-            End If
-
-            Dim oAsset As Asset = GetAppearance(oAsmDoc, sAppearanceName)
-            If oAsset Is Nothing Then
-                Logger.Warn("Appearance '" & sAppearanceName & "' not found (not in this document or any loaded Asset Library) — '" & oOcc.Name & "' left uncolored.")
-                failCount = failCount + 1
-            Else
+                Dim oPartDoc As Document = Nothing
                 Try
-                    oOcc.Appearance = oAsset
-                    coloredCount = coloredCount + 1
-                Catch ex As Exception
-                    failCount = failCount + 1
-                    Logger.Warn("Could not set Appearance on '" & oOcc.Name & "': " & ex.Message)
+                    oPartDoc = oOcc.Definition.Document
+                Catch
+                    Continue For   ' virtual component or similar with no backing document
                 End Try
-            End If
+                If oPartDoc Is Nothing OrElse oPartDoc.DocumentType <> kPartDocumentObject Then Continue For
 
-            If Not counts.ContainsKey(sMaterial) Then
-                counts(sMaterial) = 0
-                appearanceUsed(sMaterial) = sAppearanceName
-            End If
-            counts(sMaterial) = counts(sMaterial) + 1
+                Dim sDocKey As String = oPartDoc.FullFileName
+                Dim sMaterial As String = ""
+                If materialCache.ContainsKey(sDocKey) Then
+                    sMaterial = materialCache(sDocKey)
+                Else
+                    sMaterial = GetMaterialName(oPartDoc)
+                    materialCache(sDocKey) = sMaterial
+                End If
+                If String.IsNullOrEmpty(sMaterial) Then sMaterial = "(no material assigned)"
 
-        Catch ex As Exception
-            failCount = failCount + 1
-            Logger.Warn("Occurrence failed: " & ex.Message)
+                Dim sAppearanceName As String = FallbackAppearanceName
+                If MaterialAppearanceMap.ContainsKey(sMaterial) Then
+                    sAppearanceName = MaterialAppearanceMap(sMaterial)
+                Else
+                    unmapped.Add(sMaterial)
+                End If
+
+                Dim oAsset As Asset = Nothing
+                If assetCache.ContainsKey(sAppearanceName) Then
+                    oAsset = assetCache(sAppearanceName)
+                Else
+                    oAsset = GetAppearance(oAsmDoc, sAppearanceName)
+                    If Not (oAsset Is Nothing) Then assetCache(sAppearanceName) = oAsset
+                End If
+
+                If oAsset Is Nothing Then
+                    Logger.Warn("Appearance '" & sAppearanceName & "' not found (not in this document or any loaded Asset Library) — '" & oOcc.Name & "' left uncolored.")
+                    failCount = failCount + 1
+                Else
+                    Try
+                        oOcc.Appearance = oAsset
+                        coloredCount = coloredCount + 1
+                    Catch ex As Exception
+                        failCount = failCount + 1
+                        Logger.Warn("Could not set Appearance on '" & oOcc.Name & "': " & ex.Message)
+                    End Try
+                End If
+
+                If Not counts.ContainsKey(sMaterial) Then
+                    counts(sMaterial) = 0
+                    appearanceUsed(sMaterial) = sAppearanceName
+                End If
+                counts(sMaterial) = counts(sMaterial) + 1
+
+            Catch ex As Exception
+                failCount = failCount + 1
+                Logger.Warn("Occurrence failed: " & ex.Message)
+            End Try
+        Next
+    Finally
+        Try
+            ThisApplication.ScreenUpdating = wasUpdating
+        Catch
         End Try
-    Next
+    End Try
 
     Logger.Info(coloredCount & " occurrence(s) colored, " & failCount & " failed/skipped.")
     If unmapped.Count > 0 Then
@@ -170,6 +249,54 @@ Sub Main()
 
     MessageBox.Show(sReport, "Color By Material — Summary")
 
+End Sub
+
+
+' =====================================================================
+Sub RevertAppearances(oCompDef As AssemblyComponentDefinition)
+' Clears the occurrence-level override on every leaf occurrence — setting
+' Appearance = Nothing is the documented way to drop an override and fall
+' back to whatever appearance the part itself defines. Does not touch any
+' CSV file or custom iProperty a previous "Apply" run wrote; those stay as a
+' history of what was applied, they just no longer describe what's on screen.
+    Dim oOccs As Object
+    Try
+        oOccs = oCompDef.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oCompDef.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — only top-level occurrences will be reverted.")
+    End Try
+
+    Dim wasUpdating As Boolean = True
+    Try
+        wasUpdating = ThisApplication.ScreenUpdating
+        ThisApplication.ScreenUpdating = False
+    Catch
+    End Try
+
+    Dim revertedCount As Integer = 0
+    Dim failCount As Integer = 0
+    Try
+        For Each oOcc As ComponentOccurrence In oOccs
+            Try
+                If oOcc.Suppressed Then Continue For
+                oOcc.Appearance = Nothing
+                revertedCount = revertedCount + 1
+            Catch ex As Exception
+                failCount = failCount + 1
+                Logger.Warn("Could not revert appearance on '" & oOcc.Name & "': " & ex.Message)
+            End Try
+        Next
+    Finally
+        Try
+            ThisApplication.ScreenUpdating = wasUpdating
+        Catch
+        End Try
+    End Try
+
+    Logger.Info(revertedCount & " occurrence(s) reverted to their original appearance, " & failCount & " failed.")
+    MessageBox.Show(revertedCount & " part(s) reverted to their original appearance." & vbCrLf & _
+        failCount & " failed (see Logger).", "Color By Material — Revert")
 End Sub
 
 
