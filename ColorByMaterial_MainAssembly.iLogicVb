@@ -1,0 +1,300 @@
+' =====================================================================
+'  COLOR BY MATERIAL — Main Assembly  (rule name: ColorByMaterial)
+'  Purpose: color every part occurrence in the active assembly according to
+'    its assigned Material iProperty, using a user-edited Material -> Appearance
+'    lookup table below. Also produces a PERSISTENT count of parts per
+'    material + color, in two forms that survive after this rule finishes
+'    (unlike a MessageBox, which disappears once dismissed, or the iLogic Log
+'    window, which clears/scrolls away):
+'      1. A custom iProperty on the assembly ("ColorByMaterial Summary"),
+'         readable any time via File > iProperties > Custom — no drawing
+'         needed. NOTE: like any iProperty edit, it only survives to disk
+'         once you save the assembly — this rule does NOT auto-save it for
+'         you (auto-saving the document you have open is a bigger side
+'         effect than a coloring/reporting rule should take without asking).
+'      2. A CSV file written next to the assembly
+'         ("<assembly name>_ColorByMaterial.csv") — Material, Appearance,
+'         PartCount columns, openable in Excel, independent of Inventor.
+'
+'  Run with the main .iam as the ACTIVE document.
+'  Structured as External Rule (Sub Main + helpers), matching
+'  DrawingAutomation_MainAssembly.iLogicVb in this repo.
+'
+'  v1 — first draft. NOT yet run against a live Inventor session (unlike
+'  DrawingAutomation_MainAssembly, whose version history in this repo reflects
+'  several rounds of real runtime debugging). Every member used below is a
+'  standard, documented part of the Inventor API (ComponentOccurrence.Appearance,
+'  PartComponentDefinition.Material, AssetLibrary.AppearanceAssets, custom
+'  iProperties) rather than the kind of underdocumented call that needed five
+'  attempts in the drawing rule (AddTitleBlock, Sheet.BendTables) — but
+'  "documented" is not the same as "verified on this build", so it still
+'  follows the same defensive Try/Catch + Logger pattern established there.
+'  Run it once and report back what Logger shows; expect small fixes, same as
+'  the other rule's early versions.
+'
+'  MATERIAL NAMES ARE LOCALIZED / INSTALL-SPECIFIC: the sample map below uses
+'  English placeholder names. DrawingAutomation_MainAssembly's own header notes
+'  this Inventor install appears to be German (part names). If the Material
+'  iProperty values here are also localized (e.g. "Stahl, unlegiert" instead
+'  of "Steel, Mild"), the map below won't match anything and every part will
+'  fall back to FallbackAppearanceName, logged as one "unmapped" warning.
+'  Check one part's iProperties > Physical tab for the exact string and edit
+'  the map accordingly.
+'
+'  DESIGN CHOICE — occurrence-level override, not document-level: this rule
+'  sets Appearance on each ComponentOccurrence, which only changes how the
+'  part looks INSIDE THIS ASSEMBLY. It does not touch the part (.ipt) files
+'  themselves, so nothing else that references those parts changes, and
+'  nothing needs saving/checking out except this assembly. Trade-off: if the
+'  same part is used in another assembly, that assembly won't show the color
+'  unless this rule (or something like it) also runs there. Coloring every
+'  use of a material consistently everywhere would instead mean setting
+'  Appearance on each PART's ComponentDefinition — bigger blast radius
+'  (touches every part file) — not implemented here.
+' =====================================================================
+
+Imports System.Collections.Generic
+
+Sub Main()
+
+    ' ---------------- CONSTANTS — EDIT THESE ----------------
+    ' Keys must match this assembly's Material iProperty values EXACTLY
+    ' (lookup below is case-insensitive, but spelling/wording must match —
+    ' see the localization note in the header above).
+    ' Values are Inventor Appearance (Asset) names — resolved first from this
+    ' document's own Assets, then copied in from any loaded Asset Library if
+    ' not already present (see GetAppearance below).
+    Dim MaterialAppearanceMap As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    MaterialAppearanceMap.Add("Steel, Mild", "Steel - Satin")
+    MaterialAppearanceMap.Add("Steel", "Steel - Satin")
+    MaterialAppearanceMap.Add("Stainless Steel", "Stainless Steel - Polished")
+    MaterialAppearanceMap.Add("Aluminum, 6061", "Aluminum - Satin")
+    MaterialAppearanceMap.Add("Aluminum", "Aluminum - Satin")
+    MaterialAppearanceMap.Add("Brass", "Brass - Satin")
+    MaterialAppearanceMap.Add("Copper", "Copper - Polished")
+    MaterialAppearanceMap.Add("ABS Plastic", "Plastic - Matte (Black)")
+    MaterialAppearanceMap.Add("Nylon", "Plastic - Translucent (White)")
+
+    Dim FallbackAppearanceName As String = "Default"   ' used (and logged) for any material not in the map above
+
+    ' ---------------- VALIDATE ACTIVE DOC ----------------
+    If ThisDoc.Document.DocumentType <> kAssemblyDocumentObject Then
+        MessageBox.Show("Open the main assembly (.iam) and re-run.", "Wrong document type")
+        Exit Sub
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = ThisDoc.Document
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+    ' ---------------- WALK LEAF OCCURRENCES ----------------
+    ' Occurrences (not unique part documents) are counted, so a part used 3x
+    ' in this assembly contributes 3 to its material's count — matches how a
+    ' parts list QTY column would read, and each occurrence needs its own
+    ' Appearance override applied regardless of whether other occurrences
+    ' share the same underlying document.
+    Dim oOccs As Object
+    Try
+        oOccs = oCompDef.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oCompDef.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — only top-level occurrences will be colored/counted; parts nested inside subassemblies will be skipped.")
+    End Try
+
+    Dim counts As New Dictionary(Of String, Integer)(StringComparer.OrdinalIgnoreCase)
+    Dim appearanceUsed As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    Dim unmapped As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Dim coloredCount As Integer = 0
+    Dim failCount As Integer = 0
+
+    For Each oOcc As ComponentOccurrence In oOccs
+        Try
+            If oOcc.Suppressed Then Continue For
+
+            Dim oPartDoc As Document = Nothing
+            Try
+                oPartDoc = oOcc.Definition.Document
+            Catch
+                Continue For   ' virtual component or similar with no backing document
+            End Try
+            If oPartDoc Is Nothing OrElse oPartDoc.DocumentType <> kPartDocumentObject Then Continue For
+
+            Dim sMaterial As String = GetMaterialName(oPartDoc)
+            If String.IsNullOrEmpty(sMaterial) Then sMaterial = "(no material assigned)"
+
+            Dim sAppearanceName As String = FallbackAppearanceName
+            If MaterialAppearanceMap.ContainsKey(sMaterial) Then
+                sAppearanceName = MaterialAppearanceMap(sMaterial)
+            Else
+                unmapped.Add(sMaterial)
+            End If
+
+            Dim oAsset As Asset = GetAppearance(oAsmDoc, sAppearanceName)
+            If oAsset Is Nothing Then
+                Logger.Warn("Appearance '" & sAppearanceName & "' not found (not in this document or any loaded Asset Library) — '" & oOcc.Name & "' left uncolored.")
+                failCount = failCount + 1
+            Else
+                Try
+                    oOcc.Appearance = oAsset
+                    coloredCount = coloredCount + 1
+                Catch ex As Exception
+                    failCount = failCount + 1
+                    Logger.Warn("Could not set Appearance on '" & oOcc.Name & "': " & ex.Message)
+                End Try
+            End If
+
+            If Not counts.ContainsKey(sMaterial) Then
+                counts(sMaterial) = 0
+                appearanceUsed(sMaterial) = sAppearanceName
+            End If
+            counts(sMaterial) = counts(sMaterial) + 1
+
+        Catch ex As Exception
+            failCount = failCount + 1
+            Logger.Warn("Occurrence failed: " & ex.Message)
+        End Try
+    Next
+
+    Logger.Info(coloredCount & " occurrence(s) colored, " & failCount & " failed/skipped.")
+    If unmapped.Count > 0 Then
+        Logger.Warn(unmapped.Count & " material name(s) not found in MaterialAppearanceMap — colored with fallback '" & _
+            FallbackAppearanceName & "' instead: " & String.Join(", ", unmapped))
+    End If
+
+    ' ---------------- PERSISTENT OUTPUT ----------------
+    Dim sReport As String = BuildReport(counts, appearanceUsed)
+
+    WriteSummaryIProperty(oAsmDoc, sReport)
+
+    Dim sCsvPath As String = ThisDoc.Path & "\" & ThisDoc.FileName(False) & "_ColorByMaterial.csv"
+    WriteCsvReport(sCsvPath, counts, appearanceUsed)
+
+    MessageBox.Show(sReport, "Color By Material — Summary")
+
+End Sub
+
+
+' =====================================================================
+Function GetMaterialName(oDoc As Document) As String
+' Primary path: PartComponentDefinition.Material.Name (Inventor 2018+ physical
+' material object). Falls back to the classic "Material" iProperty in the
+' Design Tracking Properties set for older builds / if that member is missing
+' — same layered-fallback pattern used throughout DrawingAutomation_MainAssembly.
+    Try
+        Return oDoc.ComponentDefinition.Material.Name
+    Catch
+    End Try
+    Try
+        Return oDoc.PropertySets.Item("Design Tracking Properties").Item("Material").Value.ToString()
+    Catch
+    End Try
+    Return ""
+End Function
+
+
+' =====================================================================
+Function GetAppearance(oDoc As Document, sName As String) As Asset
+' Looks for the named appearance already local to this document first (cheap,
+' no copy needed). If not present, scans every loaded Asset Library and copies
+' the first match into this document — the standard way to pull in an
+' appearance that exists in a library but hasn't been used in this file yet.
+    Try
+        Return oDoc.Assets.Item(sName)
+    Catch
+    End Try
+
+    Try
+        For Each oLib As AssetLibrary In ThisApplication.AssetLibraries
+            Try
+                Dim oLibAsset As Asset = oLib.AppearanceAssets.Item(sName)
+                Return oLibAsset.CopyTo(oDoc, True)
+            Catch
+                ' not in this library — try the next one
+            End Try
+        Next
+    Catch ex As Exception
+        Logger.Warn("Could not enumerate Asset Libraries while looking up '" & sName & "': " & ex.Message)
+    End Try
+
+    Return Nothing
+End Function
+
+
+' =====================================================================
+Function BuildReport(counts As Dictionary(Of String, Integer), appearanceUsed As Dictionary(Of String, String)) As String
+    Dim keys As New List(Of String)(counts.Keys)
+    keys.Sort()
+
+    Dim sb As New System.Text.StringBuilder
+    sb.AppendLine("Color By Material — part count (" & Now.ToString("yyyy-MM-dd HH:mm") & ")")
+    sb.AppendLine("")
+
+    Dim total As Integer = 0
+    For Each k As String In keys
+        sb.AppendLine(k & "  —  " & appearanceUsed(k) & "  —  " & counts(k) & " part(s)")
+        total = total + counts(k)
+    Next
+
+    sb.AppendLine("")
+    sb.AppendLine("Total: " & total & " part(s) across " & keys.Count & " material(s)")
+
+    Return sb.ToString()
+End Function
+
+
+' =====================================================================
+Sub WriteSummaryIProperty(oDoc As Document, sText As String)
+' Writes the report into a custom iProperty so it stays readable (File >
+' iProperties > Custom tab) without needing this rule's log or a drawing.
+' Does NOT save the document — an iLogic rule silently saving the assembly
+' you have open is a bigger side effect than a color/reporting rule should
+' take on its own. Save manually once you're happy with the result, or the
+' iProperty content stays unsaved-in-memory like any other rule-driven edit.
+    Try
+        Dim oPropSet As PropertySet = oDoc.PropertySets.Item("Inventor User Defined Properties")
+
+        Try
+            oPropSet.Item("ColorByMaterial Summary").Value = sText
+        Catch
+            oPropSet.Add(sText, "ColorByMaterial Summary")
+        End Try
+
+        Try
+            oPropSet.Item("ColorByMaterial Last Run").Value = Now.ToString("yyyy-MM-dd HH:mm")
+        Catch
+            oPropSet.Add(Now.ToString("yyyy-MM-dd HH:mm"), "ColorByMaterial Last Run")
+        End Try
+
+        Logger.Info("Summary written to custom iProperty 'ColorByMaterial Summary' (save the assembly to persist it to disk).")
+    Catch ex As Exception
+        Logger.Warn("Could not write custom iProperty summary: " & ex.Message)
+    End Try
+End Sub
+
+
+' =====================================================================
+Sub WriteCsvReport(sPath As String, counts As Dictionary(Of String, Integer), appearanceUsed As Dictionary(Of String, String))
+    Try
+        Dim keys As New List(Of String)(counts.Keys)
+        keys.Sort()
+
+        Dim sb As New System.Text.StringBuilder
+        sb.AppendLine("Material,Appearance,PartCount")
+        For Each k As String In keys
+            sb.AppendLine(CsvEscape(k) & "," & CsvEscape(appearanceUsed(k)) & "," & counts(k))
+        Next
+
+        System.IO.File.WriteAllText(sPath, sb.ToString())
+        Logger.Info("CSV report written: " & sPath)
+    Catch ex As Exception
+        Logger.Warn("Could not write CSV report to '" & sPath & "': " & ex.Message)
+    End Try
+End Sub
+
+
+' =====================================================================
+Function CsvEscape(s As String) As String
+    If s.Contains(",") Or s.Contains("""") Then
+        Return """" & s.Replace("""", """""") & """"
+    End If
+    Return s
+End Function
