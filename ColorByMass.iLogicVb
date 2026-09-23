@@ -1,0 +1,176 @@
+﻿Sub Main()
+    Dim asmDoc As AssemblyDocument = ThisApplication.ActiveDocument
+    Dim asmDef As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+
+    ' ---- CONFIG ----
+    Const USE_LOG_SCALE As Boolean = True   ' flip to False if max/min ratio (printed below) is < ~10
+    ' ----------------
+
+    Dim swTotal As New System.Diagnostics.Stopwatch : swTotal.Start()
+    Dim swMass As New System.Diagnostics.Stopwatch
+    Dim totalOcc As Integer = 0, skipped As Integer = 0
+
+    Dim wasScreenUpdating As Boolean = ThisApplication.ScreenUpdating
+    ThisApplication.ScreenUpdating = False
+
+    ' ---- Pass 1: one representative occurrence per unique document ----
+    Dim occByDoc As New Dictionary(Of Document, ComponentOccurrence)
+    Dim allOccs As New List(Of ComponentOccurrence)
+
+    For Each occ As ComponentOccurrence In asmDef.Occurrences.AllLeafOccurrences
+        totalOcc += 1
+        If occ.Suppressed Then skipped += 1 : Continue For
+        allOccs.Add(occ)
+        Dim refDoc As Document = occ.Definition.Document
+        If Not occByDoc.ContainsKey(refDoc) Then occByDoc.Add(refDoc, occ)
+    Next
+
+    Dim massByDoc As New Dictionary(Of Document, Double)
+    Dim minMass As Double = Double.MaxValue
+    Dim maxMass As Double = Double.MinValue
+    Dim massFailures As Integer = 0
+    Dim massFailDocs As New List(Of String)
+
+    For Each kvp As KeyValuePair(Of Document, ComponentOccurrence) In occByDoc
+        swMass.Start()
+        Try
+            Dim m As Double = kvp.Value.MassProperties.Mass   ' kg, Inventor generic units
+            massByDoc.Add(kvp.Key, m)
+            If m < minMass Then minMass = m
+            If m > maxMass Then maxMass = m
+        Catch ex As Exception
+            massFailures += 1
+            massFailDocs.Add(kvp.Key.DisplayName & " :: " & ex.Message)
+            massByDoc.Add(kvp.Key, 0.0)   ' fallback -> renders coldest (blue)
+        End Try
+        swMass.Stop()
+    Next
+
+    If minMass = Double.MaxValue Then minMass = 0.0
+    If maxMass = Double.MinValue Then maxMass = 1.0
+    If maxMass <= minMass Then maxMass += 0.000001   ' guard divide-by-zero, all-equal case
+
+    Dim logMin As Double = Math.Log(Math.Max(minMass, 0.000001))
+    Dim logMax As Double = Math.Log(Math.Max(maxMass, 0.000001))
+
+    ' ---- Pass 2: one gradient asset per unique doc, assign to all its occurrences ----
+    Dim existingNames As New HashSet(Of String)
+    For Each a As Asset In asmDoc.Assets
+        existingNames.Add(a.Name)
+    Next
+
+    Dim tm As TransactionManager = ThisApplication.TransactionManager
+    Dim chunkSize As Integer = 200
+    Dim inChunk As Integer = 0
+    Dim trans As Transaction = tm.StartTransaction(asmDoc, "Weight Heatmap")
+    Dim transOpen As Boolean = True
+
+    Dim assetCache As New Dictionary(Of Document, Asset)
+    Dim writeFailures As Integer = 0
+
+    Try
+        For Each occ As ComponentOccurrence In allOccs
+            Dim refDoc As Document = occ.Definition.Document
+            Dim asset As Asset = Nothing
+
+            If Not assetCache.TryGetValue(refDoc, asset) Then
+                Dim mass As Double = massByDoc(refDoc)
+                Dim tVal As Double
+                If USE_LOG_SCALE Then
+                    tVal = (Math.Log(Math.Max(mass, 0.000001)) - logMin) / (logMax - logMin)
+                Else
+                    tVal = (mass - minMass) / (maxMass - minMass)
+                End If
+                tVal = Math.Max(0.0, Math.Min(1.0, tVal))
+
+                Dim hue As Double = (1.0 - tVal) * 0.667   ' t=0 blue(light) -> t=1 red(heavy)
+                Dim r As Byte, g As Byte, b As Byte
+                HSVtoRGB(hue, 0.85, 0.95, r, g, b)
+
+                Dim appName As String = "WeightHeat_" & assetCache.Count.ToString("000")
+                Try
+                    If existingNames.Contains(appName) Then
+                        asset = asmDoc.Assets.Item(appName)
+                    Else
+                        asset = asmDoc.Assets.Add(AssetTypeEnum.kAssetTypeAppearance, _
+                                "Generic", Type.Missing, appName)
+                        Dim cv As ColorAssetValue = asset.Item("generic_diffuse")
+                        cv.Value = ThisApplication.TransientObjects.CreateColor(r, g, b)
+                        existingNames.Add(asset.Name)
+                    End If
+                Catch
+                    writeFailures += 1
+                    Continue For
+                End Try
+
+                assetCache.Add(refDoc, asset)
+            End If
+
+            Try
+                occ.Appearance = asset
+            Catch
+                writeFailures += 1
+            End Try
+
+            inChunk += 1
+            If inChunk >= chunkSize Then
+                trans.End()
+                trans = tm.StartTransaction(asmDoc, "Weight Heatmap")
+                inChunk = 0
+            End If
+        Next
+        trans.End()
+        transOpen = False
+    Catch exOuter As Exception
+        If transOpen Then
+            Try : trans.End() : Catch : Try : trans.Abort() : Catch : End Try : End Try
+        End If
+        ThisApplication.ScreenUpdating = wasScreenUpdating
+        MessageBox.Show("Aborted: " & exOuter.Message, "WeightHeatmap - Fatal")
+        Exit Sub
+    Finally
+        ThisApplication.ScreenUpdating = wasScreenUpdating
+    End Try
+
+    InventorVb.DocumentUpdate()
+    swTotal.Stop()
+
+    Dim ratio As Double = maxMass / Math.Max(minMass, 0.000001)
+    Dim msg As String = _
+        "Total occurrences: " & totalOcc & vbCrLf & _
+        "Suppressed skipped: " & skipped & vbCrLf & _
+        "Unique parts: " & occByDoc.Count & vbCrLf & _
+        "Mass calc failures: " & massFailures & vbCrLf & _
+        "Appearance write failures: " & writeFailures & vbCrLf & _
+        "Min mass: " & minMass.ToString("0.####") & " kg" & vbCrLf & _
+        "Max mass: " & maxMass.ToString("0.####") & " kg" & vbCrLf & _
+        "Max/Min ratio: " & ratio.ToString("0.#") & IIf(ratio > 50, "  <- log scale strongly recommended", "") & vbCrLf & _
+        "Scale used: " & IIf(USE_LOG_SCALE, "Logarithmic", "Linear") & vbCrLf & _
+        "Elapsed: " & (swTotal.ElapsedMilliseconds/1000.0).ToString("0.0") & " s" & vbCrLf & _
+        "  mass calc: " & swMass.ElapsedMilliseconds & " ms"
+
+    If massFailures > 0 Then
+        msg &= vbCrLf & vbCrLf & "First mass failures:" & vbCrLf & String.Join(vbCrLf, massFailDocs.Take(5))
+    End If
+
+    MessageBox.Show(msg, "Weight Heatmap")
+End Sub
+
+Sub HSVtoRGB(h As Double, s As Double, v As Double, _
+             ByRef r As Byte, ByRef g As Byte, ByRef b As Byte)
+    Dim i As Integer = CInt(Math.Floor(h * 6))
+    Dim f As Double = h * 6 - i
+    Dim p As Double = v * (1 - s)
+    Dim q As Double = v * (1 - f * s)
+    Dim t As Double = v * (1 - (1 - f) * s)
+    Dim rd As Double, gd As Double, bd As Double
+    Select Case i Mod 6
+        Case 0 : rd = v : gd = t : bd = p
+        Case 1 : rd = q : gd = v : bd = p
+        Case 2 : rd = p : gd = v : bd = t
+        Case 3 : rd = p : gd = q : bd = v
+        Case 4 : rd = t : gd = p : bd = v
+        Case 5 : rd = v : gd = p : bd = q
+    End Select
+    r = CByte(rd * 255) : g = CByte(gd * 255) : b = CByte(bd * 255)
+End Sub

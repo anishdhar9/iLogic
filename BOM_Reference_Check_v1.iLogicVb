@@ -1,0 +1,113 @@
+﻿' REF_BOM_AUDIT — find / highlight / export effectively-Reference components
+' Run from the top-level assembly, in the model state used for release.
+Sub Main()
+    If ThisApplication.ActiveDocument Is Nothing OrElse _
+       ThisApplication.ActiveDocument.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+        MessageBox.Show("Run this rule from an assembly document.", "REF Audit") : Return
+    End If
+
+    Dim oDoc As AssemblyDocument = CType(ThisApplication.ActiveDocument, AssemblyDocument)
+
+    ' clear highlight from a previous run this session
+    If SharedVariable.Exists("REF_HS") Then
+        Try : CType(SharedVariable("REF_HS"), HighlightSet).Clear() : Catch : End Try
+    End If
+
+    Dim oHS As HighlightSet = oDoc.CreateHighlightSet()
+    oHS.Color = ThisApplication.TransientObjects.CreateColor(255, 0, 255) ' magenta
+
+    Dim rows As New List(Of String)
+    rows.Add("Level,ParentPath,Occurrence,PartNumber,Description,Type,RefSource")
+
+    Dim stats(3) As Integer            ' 0=ref rows, 1=occ overrides, 2=suppressed, 3=errors
+    Dim uniquePN As New HashSet(Of String)
+
+    Try
+        ThisApplication.ScreenUpdating = False        ' [UNVERIFIED — low risk, see register]
+        Walk(oDoc.ComponentDefinition.Occurrences, oDoc.DisplayName, 1, oHS, rows, stats, uniquePN)
+    Finally
+        ThisApplication.ScreenUpdating = True
+    End Try
+
+    SharedVariable("REF_HS") = oHS
+
+    Dim folder As String = ""
+    Try : folder = System.IO.Path.GetDirectoryName(oDoc.FullFileName) : Catch : End Try
+    If String.IsNullOrEmpty(folder) Then folder = System.IO.Path.GetTempPath()
+    Dim csvPath As String = System.IO.Path.Combine(folder, _
+        System.IO.Path.GetFileNameWithoutExtension(oDoc.DisplayName) & "_REF_AUDIT.csv")
+    System.IO.File.WriteAllLines(csvPath, rows)
+
+    Dim msg As String = _
+        "Reference rows: " & stats(0) & vbCrLf & _
+        "  - occurrence-level overrides: " & stats(1) & vbCrLf & _
+        "  - document-default (set in file): " & (stats(0) - stats(1)) & vbCrLf & _
+        "Unique part numbers: " & uniquePN.Count & vbCrLf & _
+        "Suppressed skipped: " & stats(2) & "   Errors: " & stats(3) & vbCrLf & vbCrLf & _
+        "Highlight is transient (re-run refreshes, dies with the doc)." & vbCrLf & _
+        "CSV: " & csvPath & vbCrLf & vbCrLf & "Open CSV now?"
+
+    If MessageBox.Show(msg, "REF Audit — " & oDoc.DisplayName, _
+        MessageBoxButtons.YesNo, MessageBoxIcon.Information) = DialogResult.Yes Then
+        System.Diagnostics.Process.Start( _
+            New System.Diagnostics.ProcessStartInfo(csvPath) With {.UseShellExecute = True})
+    End If
+End Sub
+
+Sub Walk(occs As System.Collections.IEnumerable, parentPath As String, level As Integer, _
+         oHS As HighlightSet, rows As List(Of String), stats() As Integer, _
+         uniquePN As HashSet(Of String))
+
+    For Each occ As ComponentOccurrence In occs
+        Try
+            If occ.Suppressed Then stats(2) += 1 : Continue For
+
+            Dim isVirtual As Boolean = TypeOf occ.Definition Is VirtualComponentDefinition
+            Dim isAsm As Boolean = False
+            If Not isVirtual Then _
+                isAsm = (occ.DefinitionDocumentType = DocumentTypeEnum.kAssemblyDocumentObject)
+
+            ' effective BOM structure
+            Dim src As String = "OccurrenceOverride"
+            Dim eff As BOMStructureEnum = occ.BOMStructure
+            If eff = BOMStructureEnum.kDefaultBOMStructure Then
+                eff = occ.Definition.BOMStructure
+                src = "DocumentDefault"
+            End If
+
+            If eff = BOMStructureEnum.kReferenceBOMStructure Then
+                Dim pn As String = occ.Name, desc As String = ""
+                Try
+                    Dim ps As PropertySet = _
+                        occ.Definition.Document.PropertySets.Item("Design Tracking Properties")
+                    pn = CStr(ps.Item("Part Number").Value)
+                    desc = CStr(ps.Item("Description").Value)
+                Catch   ' virtual comps / unresolved props -> occurrence name fallback
+                End Try
+
+                rows.Add(Csv(CStr(level)) & "," & Csv(parentPath) & "," & Csv(occ.Name) & "," & _
+                         Csv(pn) & "," & Csv(desc) & "," & _
+                         Csv(If(isVirtual, "Virtual", If(isAsm, "Assembly", "Part"))) & "," & Csv(src))
+                uniquePN.Add(pn)
+                stats(0) += 1
+                If src = "OccurrenceOverride" Then stats(1) += 1
+
+                oHS.AddItem(occ)          ' subassembly occ -> whole branch goes magenta
+                ' no recursion: children of a Reference component are excluded from BOM anyway
+
+            ElseIf isAsm Then
+                Walk(occ.SubOccurrences, parentPath & " > " & occ.Name, level + 1, _
+                     oHS, rows, stats, uniquePN)
+            End If
+
+        Catch ex As Exception
+            stats(3) += 1
+            rows.Add(Csv("?") & "," & Csv(parentPath) & "," & Csv(occ.Name) & "," & _
+                     Csv("ERROR") & "," & Csv("") & "," & Csv("") & "," & Csv(ex.Message))
+        End Try
+    Next
+End Sub
+
+Function Csv(s As String) As String
+    Return """" & s.Replace("""", """""") & """"
+End Function

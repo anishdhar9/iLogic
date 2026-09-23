@@ -1,0 +1,124 @@
+﻿Sub Main()
+    Dim asmDoc As AssemblyDocument = ThisApplication.ActiveDocument
+    Dim asmDef As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+
+    Dim swTotal As New System.Diagnostics.Stopwatch : swTotal.Start()
+    Dim totalOcc As Integer = 0, skipped As Integer = 0, addFailures As Integer = 0
+
+    Dim existingNames As New HashSet(Of String)
+    For Each a As Asset In asmDoc.Assets
+        existingNames.Add(a.Name)
+    Next
+
+    Dim wasScreenUpdating As Boolean = ThisApplication.ScreenUpdating
+    ThisApplication.ScreenUpdating = False
+
+    Dim tm As TransactionManager = ThisApplication.TransactionManager
+    Dim chunkSize As Integer = 200
+    Dim inChunk As Integer = 0
+    Dim trans As Transaction = tm.StartTransaction(asmDoc, "AutoColor Unique Parts")
+    Dim transOpen As Boolean = True
+
+    Dim assetCache As New Dictionary(Of Document, Asset)
+    Dim failedDocs As New List(Of String)
+
+    Try
+        For Each occ As ComponentOccurrence In asmDef.Occurrences.AllLeafOccurrences
+            totalOcc += 1
+            If occ.Suppressed Then skipped += 1 : Continue For
+
+            Dim refDoc As Document = occ.Definition.Document
+            Dim asset As Asset = Nothing
+
+            If Not assetCache.TryGetValue(refDoc, asset) Then
+                Dim idx As Integer = assetCache.Count
+                Dim appName As String = "AutoColor_" & idx.ToString("000")
+
+                Try
+                    If existingNames.Contains(appName) Then
+                        asset = asmDoc.Assets.Item(appName)
+                    Else
+                        Dim hue As Double = (idx * 0.618033988749895) Mod 1.0
+                        Dim r As Byte, g As Byte, b As Byte
+                        HSVtoRGB(hue, 0.7, 0.95, r, g, b)
+
+                        ' FIX: Reserved = Type.Missing (per Add()'s own type library — never a real value)
+                        asset = asmDoc.Assets.Add(AssetTypeEnum.kAssetTypeAppearance, _
+                                "Generic", Type.Missing, appName)
+
+                        Dim cv As ColorAssetValue = asset.Item("generic_diffuse")
+                        cv.Value = ThisApplication.TransientObjects.CreateColor(r, g, b)
+
+                        existingNames.Add(asset.Name)   ' record ACTUAL name, not assumed appName
+                    End If
+                Catch ex As Exception
+                    addFailures += 1
+                    failedDocs.Add(refDoc.DisplayName & " :: " & ex.Message)
+                    Continue For
+                End Try
+
+                assetCache.Add(refDoc, asset)
+            End If
+
+            Try
+                occ.Appearance = asset
+            Catch
+                addFailures += 1
+                failedDocs.Add(refDoc.DisplayName & " :: appearance write failed")
+            End Try
+
+            inChunk += 1
+            If inChunk >= chunkSize Then
+                trans.End()
+                trans = tm.StartTransaction(asmDoc, "AutoColor Unique Parts")
+                inChunk = 0
+            End If
+        Next
+        trans.End()
+        transOpen = False
+    Catch exOuter As Exception
+        If transOpen Then
+            Try : trans.End() : Catch : Try : trans.Abort() : Catch : End Try : End Try
+        End If
+        ThisApplication.ScreenUpdating = wasScreenUpdating
+        MessageBox.Show("Aborted: " & exOuter.Message, "AutoColor - Fatal")
+        Exit Sub
+    Finally
+        ThisApplication.ScreenUpdating = wasScreenUpdating
+    End Try
+
+    InventorVb.DocumentUpdate()
+    swTotal.Stop()
+
+    Dim msg As String = _
+        "Total occurrences: " & totalOcc & vbCrLf & _
+        "Suppressed skipped: " & skipped & vbCrLf & _
+        "Unique parts colored: " & assetCache.Count & vbCrLf & _
+        "Failures (skipped, not fatal): " & addFailures & vbCrLf & _
+        "Elapsed: " & (swTotal.ElapsedMilliseconds/1000.0).ToString("0.0") & " s"
+
+    If addFailures > 0 Then
+        msg &= vbCrLf & vbCrLf & "First failures:" & vbCrLf & String.Join(vbCrLf, failedDocs.Take(5))
+    End If
+
+    MessageBox.Show(msg, "AutoColor Timing v3")
+End Sub
+
+Sub HSVtoRGB(h As Double, s As Double, v As Double, _
+             ByRef r As Byte, ByRef g As Byte, ByRef b As Byte)
+    Dim i As Integer = CInt(Math.Floor(h * 6))
+    Dim f As Double = h * 6 - i
+    Dim p As Double = v * (1 - s)
+    Dim q As Double = v * (1 - f * s)
+    Dim t As Double = v * (1 - (1 - f) * s)
+    Dim rd As Double, gd As Double, bd As Double
+    Select Case i Mod 6
+        Case 0 : rd = v : gd = t : bd = p
+        Case 1 : rd = q : gd = v : bd = p
+        Case 2 : rd = p : gd = v : bd = t
+        Case 3 : rd = p : gd = q : bd = v
+        Case 4 : rd = t : gd = p : bd = v
+        Case 5 : rd = v : gd = p : bd = q
+    End Select
+    r = CByte(rd * 255) : g = CByte(gd * 255) : b = CByte(bd * 255)
+End Sub

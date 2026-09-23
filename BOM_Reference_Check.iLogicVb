@@ -1,0 +1,182 @@
+﻿' REF_BOM_AUDIT v2.1 — ref components, quantities, mixed-state detection
+' Run from the top-level assembly, in the model state used for release.
+
+Sub Main()
+    If ThisApplication.ActiveDocument Is Nothing OrElse _
+       ThisApplication.ActiveDocument.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+        MessageBox.Show("Run this rule from an assembly document.", "REF Audit") : Return
+    End If
+
+    Dim oDoc As AssemblyDocument = CType(ThisApplication.ActiveDocument, AssemblyDocument)
+
+    If SharedVariable.Exists("REF_HS") Then
+        Try : CType(SharedVariable("REF_HS"), HighlightSet).Clear() : Catch : End Try
+    End If
+    Dim oHS As HighlightSet = oDoc.CreateHighlightSet()
+    oHS.Color = ThisApplication.TransientObjects.CreateColor(255, 0, 255)
+
+    Dim groups As New List(Of RefGroup)
+    Dim gIndex As New Dictionary(Of String, RefGroup)
+    Dim normalCount As New Dictionary(Of String, Integer)
+    Dim pnCache As New Dictionary(Of String, String())
+    Dim errRows As New List(Of String)
+    Dim stats(3) As Integer   ' 0=ref occs, 1=occ overrides, 2=suppressed, 3=errors
+
+    Try
+        ThisApplication.ScreenUpdating = False   ' [UNVERIFIED — delete both lines if compile fails]
+        Walk(oDoc.ComponentDefinition.Occurrences, oDoc.DisplayName, 1, _
+             oHS, groups, gIndex, normalCount, pnCache, errRows, stats)
+    Finally
+        ThisApplication.ScreenUpdating = True
+    End Try
+    SharedVariable("REF_HS") = oHS
+
+    ' ---- emit CSV ----
+    Dim rows As New List(Of String)
+    rows.Add("Level,ParentPath,PartNumber,Description,Type,RefSource,Qty,QtyType,UnitQty,NormalOccsSamePN,Occurrences")
+
+    Dim mixedCt As Integer = 0
+    For Each g As RefGroup In groups
+        Dim nrm As Integer = 0
+        normalCount.TryGetValue(g.ParentPath & "|" & g.PN, nrm)
+        If nrm > 0 Then mixedCt += 1
+
+        Dim names As String
+        If g.Names.Count <= 6 Then
+            names = String.Join("; ", g.Names)
+        Else
+            names = String.Join("; ", g.Names.GetRange(0, 6)) & " (+" & (g.Names.Count - 6) & " more)"
+        End If
+
+        rows.Add(Csv(CStr(g.Level)) & "," & Csv(g.ParentPath) & "," & Csv(g.PN) & "," & _
+                 Csv(g.Desc) & "," & Csv(g.CompType) & "," & Csv(g.Src) & "," & _
+                 Csv(CStr(g.Qty)) & "," & Csv(g.QtyType) & "," & Csv(g.UnitQty) & "," & _
+                 Csv(CStr(nrm)) & "," & Csv(names))
+    Next
+    rows.AddRange(errRows)
+
+    Dim folder As String = ""
+    Try : folder = System.IO.Path.GetDirectoryName(oDoc.FullFileName) : Catch : End Try
+    If String.IsNullOrEmpty(folder) Then folder = System.IO.Path.GetTempPath()
+    Dim csvPath As String = System.IO.Path.Combine(folder, _
+        System.IO.Path.GetFileNameWithoutExtension(oDoc.DisplayName) & "_REF_AUDIT.csv")
+    System.IO.File.WriteAllLines(csvPath, rows)
+
+    Dim msg As String = _
+        "Reference rows (parent x PN x source): " & groups.Count & vbCrLf & _
+        "Reference occurrences total: " & stats(0) & vbCrLf & _
+        "  - occurrence-level overrides: " & stats(1) & vbCrLf & _
+        "MIXED-STATE part numbers: " & mixedCt & "  <- same PN also Normal under same parent (NBOM qty short)" & vbCrLf & _
+        "Suppressed skipped: " & stats(2) & "   Errors: " & stats(3) & vbCrLf & vbCrLf & _
+        "CSV: " & csvPath & vbCrLf & "Open now?"
+
+    If MessageBox.Show(msg, "REF Audit — " & oDoc.DisplayName, _
+        MessageBoxButtons.YesNo, MessageBoxIcon.Information) = DialogResult.Yes Then
+        System.Diagnostics.Process.Start( _
+            New System.Diagnostics.ProcessStartInfo(csvPath) With {.UseShellExecute = True})
+    End If
+End Sub
+
+Sub Walk(occs As System.Collections.IEnumerable, parentPath As String, level As Integer, _
+          ByRef oHS As HighlightSet, ByRef groups As List(Of RefGroup), _
+          ByRef gIndex As Dictionary(Of String, RefGroup), _
+          ByRef normalCount As Dictionary(Of String, Integer), _
+          ByRef pnCache As Dictionary(Of String, String()), _
+          ByRef errRows As List(Of String), ByRef stats() As Integer)
+
+    For Each occ As ComponentOccurrence In occs
+        Try
+            If occ.Suppressed Then stats(2) += 1 : Continue For
+
+            Dim isVirtual As Boolean = TypeOf occ.Definition Is VirtualComponentDefinition
+            Dim isAsm As Boolean = False
+            If Not isVirtual Then _
+                isAsm = (occ.DefinitionDocumentType = DocumentTypeEnum.kAssemblyDocumentObject)
+
+            Dim src As String = "OccurrenceOverride"
+            Dim eff As BOMStructureEnum = occ.BOMStructure
+            If eff = BOMStructureEnum.kDefaultBOMStructure Then
+                eff = occ.Definition.BOMStructure
+                src = "DocumentDefault"
+            End If
+
+            Dim pd As String() = GetPnDesc(occ, pnCache)
+
+            If eff = BOMStructureEnum.kReferenceBOMStructure Then
+                stats(0) += 1
+                If src = "OccurrenceOverride" Then stats(1) += 1
+
+                Dim key As String = parentPath & "|" & pd(0) & "|" & src
+                Dim g As RefGroup = Nothing
+                If Not gIndex.TryGetValue(key, g) Then
+                    g = New RefGroup
+                    g.Level = level : g.ParentPath = parentPath
+                    g.PN = pd(0) : g.Desc = pd(1) : g.Src = src
+                    g.CompType = If(isVirtual, "Virtual", If(isAsm, "Assembly", "Part"))
+                    Try
+                        Dim bq As BOMQuantity = occ.Definition.BOMQuantity        ' [UNVERIFIED]
+                        g.QtyType = bq.QuantityType.ToString().Replace("QuantityType", "").TrimStart("k"c)
+                        g.UnitQty = CStr(bq.UnitQuantity)                         ' [UNVERIFIED]
+                    Catch
+                        g.QtyType = "?" : g.UnitQty = ""
+                    End Try
+                    gIndex.Add(key, g) : groups.Add(g)
+                End If
+                g.Qty += 1
+                g.Names.Add(occ.Name)
+
+                oHS.AddItem(occ)
+                ' no recursion under Reference
+
+            Else
+                Dim nKey As String = parentPath & "|" & pd(0)
+                If normalCount.ContainsKey(nKey) Then
+                    normalCount(nKey) += 1
+                Else
+                    normalCount.Add(nKey, 1)
+                End If
+                If isAsm Then Walk(occ.SubOccurrences, parentPath & " > " & occ.Name, level + 1, _
+                                    oHS, groups, gIndex, normalCount, pnCache, errRows, stats)
+            End If
+
+        Catch ex As Exception
+            stats(3) += 1
+            Dim nm As String = "?" : Try : nm = occ.Name : Catch : End Try
+            errRows.Add(Csv("ERR") & "," & Csv(parentPath) & "," & Csv(nm) & ",,,,,,,," & Csv(ex.Message))
+        End Try
+    Next
+End Sub
+
+Function GetPnDesc(occ As ComponentOccurrence, ByRef pnCache As Dictionary(Of String, String())) As String()
+    Dim key As String = ""
+    Try : key = occ.Definition.Document.FullDocumentName : Catch : End Try
+    If key <> "" AndAlso pnCache.ContainsKey(key) Then Return pnCache(key)
+
+    Dim pn As String = occ.Name, desc As String = ""
+    Try
+        Dim ps As PropertySet = occ.Definition.Document.PropertySets.Item("Design Tracking Properties")
+        pn = CStr(ps.Item("Part Number").Value)
+        desc = CStr(ps.Item("Description").Value)
+    Catch
+    End Try
+    Dim r As String() = {pn, desc}
+    If key <> "" Then pnCache(key) = r
+    Return r
+End Function
+
+Function Csv(s As String) As String
+    Return """" & s.Replace("""", """""") & """"
+End Function
+
+Class RefGroup
+    Public Level As Integer
+    Public ParentPath As String = ""
+    Public PN As String = ""
+    Public Desc As String = ""
+    Public CompType As String = ""
+    Public Src As String = ""
+    Public Qty As Integer = 0
+    Public QtyType As String = ""
+    Public UnitQty As String = ""
+    Public Names As New List(Of String)
+End Class

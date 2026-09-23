@@ -1,0 +1,66 @@
+﻿Sub Main()
+    Dim asmDoc As AssemblyDocument = ThisApplication.ActiveDocument
+    Dim asmDef As AssemblyComponentDefinition = asmDoc.ComponentDefinition
+
+    ' Pass 1: collect unique referenced part documents
+    Dim keyIndex As New Dictionary(Of String, Integer)
+    For Each occ As ComponentOccurrence In asmDef.Occurrences.AllLeafOccurrences
+        If occ.Suppressed Then Continue For
+        Dim k As String = occ.Definition.Document.FullFileName.ToUpper()
+        If Not keyIndex.ContainsKey(k) Then keyIndex.Add(k, keyIndex.Count)
+    Next
+    Dim nUnique As Integer = keyIndex.Count
+
+    ' Pass 2: one asset per unique part, assign to all its occurrences
+    Dim assetCache As New Dictionary(Of String, Asset)
+
+    For Each occ As ComponentOccurrence In asmDef.Occurrences.AllLeafOccurrences
+        If occ.Suppressed Then Continue For
+        Dim k As String = occ.Definition.Document.FullFileName.ToUpper()
+        Dim idx As Integer = keyIndex(k)
+
+        Dim asset As Asset = Nothing
+        If Not assetCache.TryGetValue(k, asset) Then
+            Dim hue As Double = (idx * 0.618033988749895) Mod 1.0
+            Dim r As Byte, g As Byte, b As Byte
+            HSVtoRGB(hue, 0.7, 0.95, r, g, b)
+
+            Dim appName As String = "AutoColor_" & idx.ToString("000")
+            Try
+                asset = asmDoc.Assets.Item(appName)
+            Catch
+                asset = asmDoc.Assets.Add(AssetTypeEnum.kAssetTypeAppearance, _
+                        "Generic", appName, appName)
+            End Try
+
+            Dim cv As ColorAssetValue = asset.Item("generic_diffuse")
+            cv.Value = ThisApplication.TransientObjects.CreateColor(r, g, b)
+
+            assetCache.Add(k, asset)
+        End If
+
+        occ.Appearance = asset
+    Next
+
+    InventorVb.DocumentUpdate()
+    MessageBox.Show(nUnique & " unique parts colored.", "AutoColor")
+End Sub
+
+Sub HSVtoRGB(h As Double, s As Double, v As Double, _
+             ByRef r As Byte, ByRef g As Byte, ByRef b As Byte)
+    Dim i As Integer = CInt(Math.Floor(h * 6))
+    Dim f As Double = h * 6 - i
+    Dim p As Double = v * (1 - s)
+    Dim q As Double = v * (1 - f * s)
+    Dim t As Double = v * (1 - (1 - f) * s)
+    Dim rd As Double, gd As Double, bd As Double
+    Select Case i Mod 6
+        Case 0 : rd = v : gd = t : bd = p
+        Case 1 : rd = q : gd = v : bd = p
+        Case 2 : rd = p : gd = v : bd = t
+        Case 3 : rd = p : gd = q : bd = v
+        Case 4 : rd = t : gd = p : bd = v
+        Case 5 : rd = v : gd = p : bd = q
+    End Select
+    r = CByte(rd * 255) : g = CByte(gd * 255) : b = CByte(bd * 255)
+End Sub
