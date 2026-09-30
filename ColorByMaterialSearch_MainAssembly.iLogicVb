@@ -1,0 +1,212 @@
+' =====================================================================
+'  COLOR BY MATERIAL — SEARCH  (rule name: ColorByMaterialSearch)
+'  Purpose: prompt for a search term at runtime, then visually flag every
+'    leaf part whose Material contains that term (case-insensitive
+'    substring match) — a quick "find every part made of X" query, e.g.
+'    typing "316" or "C-276". Distinct from ColorByMaterial_MainAssembly.iLogicVb,
+'    which auto-colors EVERY distinct material a different color as a
+'    persistent scheme. This rule answers one search at a time and doesn't
+'    try to be persistent.
+'
+'  MECHANISM — HighlightSet overlay, not an Appearance override:
+'    Adapted from the proven pattern already in this repo
+'    (BOM_Reference_Check_v1/v2.1/v3.iLogicVb: oDoc.CreateHighlightSet() +
+'    SharedVariable to remember/clear it between runs). A HighlightSet is a
+'    transient viewport overlay — it never touches or creates an Asset, so
+'    it can't conflict with whatever ColorByMaterial/ColorByMass/ColorByCost
+'    already colored these same parts, and needs no separate "revert" step:
+'    the next run (or a canceled prompt) just clears it. Uses its own
+'    SharedVariable key ("MATSEARCH_HS", distinct from BOM_Reference_Check's
+'    "REF_HS") and a different highlight color (cyan vs. that family's
+'    magenta) so both tools can be used without one clearing the other or
+'    the colors being ambiguous in the viewport.
+'
+'  Run with the main .iam as the ACTIVE document.
+'  Structured as External Rule (Sub Main + helpers), matching every other
+'  rule in this repo. Self-contained on purpose — iLogic external rules
+'  don't cleanly import each other's helpers, and this repo's own
+'  convention (see HSVtoRGB duplicated across ColoringParts.iLogicVb,
+'  ColoringParts_v2.iLogicVb, ColorByMass.iLogicVb) is to duplicate small
+'  helpers per file rather than share them. GetMaterialName here is the
+'  same two-tier lookup already established in ColorByMaterial_MainAssembly.iLogicVb.
+'
+'  v1 — first draft. NOT yet run against a live Inventor session. HighlightSet
+'  + SharedVariable is a proven, already-working pattern in this exact repo
+'  (not a fresh guess), but "proven elsewhere in this repo" is not the same
+'  as "verified in this file" — same honesty level as every other rule here.
+'  Run it once and report back what Logger shows.
+' =====================================================================
+
+Sub Main()
+
+    ' ---------------- VALIDATE ACTIVE DOC ----------------
+    If ThisDoc.Document.DocumentType <> kAssemblyDocumentObject Then
+        MessageBox.Show("Open the main assembly (.iam) and re-run.", "Wrong document type")
+        Exit Sub
+    End If
+
+    Dim oAsmDoc As AssemblyDocument = ThisDoc.Document
+    Dim oCompDef As AssemblyComponentDefinition = oAsmDoc.ComponentDefinition
+
+    ' ---------------- CLEAR ANY PREVIOUS HIGHLIGHT ----------------
+    ' Always done first, whether or not a new search term is given below — this is
+    ' what lets a canceled/blank prompt double as a "clear" action.
+    If SharedVariable.Exists("MATSEARCH_HS") Then
+        Try
+            CType(SharedVariable("MATSEARCH_HS"), HighlightSet).Clear()
+        Catch
+        End Try
+    End If
+
+    ' ---------------- PROMPT FOR SEARCH TERM ----------------
+    Dim sSearch As String = InputBox("Search term — matches any part whose Material contains this text" & _
+        vbCrLf & "(e.g. ""316"", ""C-276""). Leave blank to just clear the previous highlight.", _
+        "Color By Material — Search", "")
+
+    If String.IsNullOrEmpty(sSearch) Then
+        Logger.Info("Color By Material Search: blank/canceled — previous highlight cleared, no new search run.")
+        Exit Sub
+    End If
+
+    ' ---------------- WALK LEAF OCCURRENCES ----------------
+    Dim oOccs As Object
+    Try
+        oOccs = oCompDef.Occurrences.AllLeafOccurrences
+    Catch
+        oOccs = oCompDef.Occurrences
+        Logger.Warn("AllLeafOccurrences unavailable — only top-level occurrences will be searched.")
+    End Try
+
+    Dim oHS As HighlightSet = oAsmDoc.CreateHighlightSet()
+    oHS.Color = ThisApplication.TransientObjects.CreateColor(0, 255, 255)   ' cyan — distinct from BOM_Reference_Check's magenta
+
+    Dim swTotal As New System.Diagnostics.Stopwatch
+    swTotal.Start()
+
+    Dim wasUpdating As Boolean = True
+    Try
+        wasUpdating = ThisApplication.ScreenUpdating
+        ThisApplication.ScreenUpdating = False
+    Catch
+    End Try
+
+    Dim matchCount As Integer = 0
+    Dim failCount As Integer = 0
+    Dim matches As New System.Text.StringBuilder
+    matches.AppendLine("OccurrenceName,PartNumber,Material")
+
+    Try
+        For Each oOcc As ComponentOccurrence In oOccs
+            Try
+                If oOcc.Suppressed Then Continue For
+
+                Dim oPartDoc As Document = Nothing
+                Try
+                    oPartDoc = oOcc.Definition.Document
+                Catch
+                    Continue For   ' virtual component or similar with no backing document
+                End Try
+                If oPartDoc Is Nothing OrElse oPartDoc.DocumentType <> kPartDocumentObject Then Continue For
+
+                Dim sMaterial As String = GetMaterialName(oPartDoc)
+                If String.IsNullOrEmpty(sMaterial) Then Continue For
+
+                If sMaterial.IndexOf(sSearch, StringComparison.OrdinalIgnoreCase) >= 0 Then
+                    Try
+                        oHS.AddItem(oOcc)
+                        matchCount = matchCount + 1
+                        matches.AppendLine(CsvEscape(oOcc.Name) & "," & CsvEscape(GetPartNumber(oPartDoc)) & "," & CsvEscape(sMaterial))
+                    Catch ex As Exception
+                        failCount = failCount + 1
+                        Logger.Warn("Could not highlight '" & oOcc.Name & "': " & ex.Message)
+                    End Try
+                End If
+
+            Catch ex As Exception
+                failCount = failCount + 1
+                Logger.Warn("Occurrence failed: " & ex.Message)
+            End Try
+        Next
+    Finally
+        Try
+            ThisApplication.ScreenUpdating = wasUpdating
+        Catch
+        End Try
+    End Try
+
+    SharedVariable("MATSEARCH_HS") = oHS
+
+    swTotal.Stop()
+    Logger.Info(matchCount & " part(s) matched """ & sSearch & """ and were highlighted (cyan), " & _
+        failCount & " failed. Elapsed " & (swTotal.ElapsedMilliseconds / 1000.0).ToString("0.0") & "s.")
+
+    ' ---------------- CSV AUDIT RECORD ----------------
+    ' Point-in-time record of this search's results. Lighter than ColorByMaterial's
+    ' custom-iProperty persistence on purpose — the highlight itself is transient by
+    ' design (see header), so a stale iProperty claiming "these were flagged" would be
+    ' misleading once the highlight is cleared by a later run.
+    Try
+        Dim sSafe As String = SanitizeForFileName(sSearch)
+        Dim sCsvPath As String = ThisDoc.Path & "\" & ThisDoc.FileName(False) & "_MaterialSearch_" & sSafe & ".csv"
+        System.IO.File.WriteAllText(sCsvPath, matches.ToString())
+        Logger.Info("CSV report written: " & sCsvPath)
+    Catch ex As Exception
+        Logger.Warn("Could not write CSV report: " & ex.Message)
+    End Try
+
+    MessageBox.Show(matchCount & " part(s) matched """ & sSearch & """." & vbCrLf & _
+        "Highlighted in cyan in the 3D view.", "Color By Material — Search")
+
+End Sub
+
+
+' =====================================================================
+Function GetMaterialName(oDoc As Document) As String
+' Same two-tier lookup as ColorByMaterial_MainAssembly.iLogicVb: PartComponentDefinition.Material.Name
+' (Inventor 2018+ physical material object), falling back to the classic "Material"
+' iProperty in Design Tracking Properties for older builds / if that member is missing.
+    Try
+        Return oDoc.ComponentDefinition.Material.Name
+    Catch
+    End Try
+    Try
+        Return oDoc.PropertySets.Item("Design Tracking Properties").Item("Material").Value.ToString()
+    Catch
+    End Try
+    Return ""
+End Function
+
+
+' =====================================================================
+Function GetPartNumber(oDoc As Document) As String
+' Same Design Tracking Properties lookup already used across the BOM_Reference_Check family.
+    Try
+        Return oDoc.PropertySets.Item("Design Tracking Properties").Item("Part Number").Value.ToString()
+    Catch
+    End Try
+    Return ""
+End Function
+
+
+' =====================================================================
+Function SanitizeForFileName(s As String) As String
+    Dim sb As New System.Text.StringBuilder
+    For Each ch As Char In s
+        If Char.IsLetterOrDigit(ch) Then
+            sb.Append(ch)
+        Else
+            sb.Append("_")
+        End If
+    Next
+    Return sb.ToString()
+End Function
+
+
+' =====================================================================
+Function CsvEscape(s As String) As String
+    If s Is Nothing Then Return ""
+    If s.Contains(",") Or s.Contains("""") Then
+        Return """" & s.Replace("""", """""") & """"
+    End If
+    Return s
+End Function
